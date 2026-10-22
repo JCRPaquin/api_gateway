@@ -1,7 +1,13 @@
+import ast
+import os
+import inspect
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from unittest import mock
 from urllib.parse import urlsplit
 import json
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 
 import pytest
 from flask import g, session as flask_session
@@ -64,6 +70,19 @@ def issue_password_reset(app, user_id, now=None):
             user_id=user_id,
             purpose="password_reset",
             target_email=str(user.email),
+            now=now,
+        )
+        session.commit()
+    return token
+
+
+def issue_email_action(app, user_id, purpose, target_email, now=None):
+    with app.session_scope() as session:
+        token = app.security_service.issue_account_action_token(
+            session,
+            user_id=user_id,
+            purpose=purpose,
+            target_email=target_email,
             now=now,
         )
         session.commit()
@@ -773,7 +792,23 @@ def test_body_routes_old_routes_and_sensitive_no_store(app, monkeypatch):
     assert client.get("/accounts/user/reset-password").status_code == 405
     assert client.get("/accounts/user/reset-password/verify").status_code == 405
 
+    legacy_token = "legacy-verification-bearer"
+    with mock.patch.object(
+        app.security_service, "verify_account_action_token"
+    ) as verify:
+        for method in ("GET", "POST", "PUT"):
+            response = client.open(
+                f"/accounts/verify/{legacy_token}",
+                method=method,
+                json={"token": legacy_token},
+            )
+            assert response.status_code in {404, 405}
+        unsupported_verify_method = client.get("/accounts/verify")
+        assert unsupported_verify_method.status_code == 405
+        verify.assert_not_called()
+
     sensitive_responses = (
+        unsupported_verify_method,
         client.get("/accounts/csrf"),
         client.get("/accounts/bootstrap"),
         client.post(
@@ -800,6 +835,9 @@ def test_body_routes_old_routes_and_sensitive_no_store(app, monkeypatch):
                 "password2": "New_valid_password2",
             },
         ),
+        client.post("/accounts/verify", json={"token": "malformed"}),
+        client.put("/accounts/verify", json={"token": "malformed"}),
+        client.put("/accounts/user/person@example.org/verify"),
         client.get("/accounts/user/token"),
     )
     for response in sensitive_responses:
@@ -809,3 +847,545 @@ def test_body_routes_old_routes_and_sensitive_no_store(app, monkeypatch):
     status = client.get("/accounts/status")
     assert "no-store" not in status.headers.get("Cache-Control", "")
     clear_cached_user()
+
+
+def test_verification_inspection_requires_csrf_and_rejects_unbounded_tokens(
+    app, monkeypatch
+):
+    client = app.test_client()
+    with mock.patch.object(
+        app.security_service, "verify_account_action_token"
+    ) as verify:
+        rejected = client.post(
+            "/accounts/verify",
+            json={"token": "body-only-verification-bearer"},
+            base_url="https://localhost",
+        )
+        assert rejected.status_code == 400
+        verify.assert_not_called()
+
+        monkeypatch.setitem(app.config, "WTF_CSRF_ENABLED", False)
+        for method in ("POST", "PUT"):
+            response = client.open(
+                "/accounts/verify",
+                method=method,
+                json={"token": "x" * 4097},
+                base_url="https://localhost",
+            )
+            assert response.status_code == 400
+            assert response.get_json() == {
+                "message": "Invalid or expired account action token"
+            }
+        verify.assert_not_called()
+
+
+def test_verification_exception_log_uses_constant_request_target(app):
+    token = "secret-body-token-that-must-not-be-logged"
+    with mock.patch.object(app.logger, "error") as logged, app.test_request_context(
+        "/accounts/verify", method="PUT", json={"token": token}
+    ):
+        app.log_exception((RuntimeError, RuntimeError("failure"), None))
+
+    assert token not in repr(logged.call_args)
+    assert "/accounts/verify" in repr(logged.call_args)
+
+
+
+
+
+def test_registration_commits_user_action_and_delivery_before_mail(app):
+    payload = {
+        "email": "atomic-registration@example.com",
+        "password1": "Valid_password1",
+        "password2": "Valid_password1",
+        "g-recaptcha-response": "test",
+    }
+    with app.test_request_context(
+        "/accounts/user", method="POST", json=payload
+    ), mock.patch.object(views, "verify_recaptcha", return_value=True), mock.patch.object(
+        notifications, "send_email"
+    ) as send:
+        response, status = views.UserManagementView().post()
+
+    assert status == 202
+    assert response == {"message": views.ACCOUNT_ACCEPTED_MESSAGE}
+    user = app.db.session.query(User).filter_by(
+        email="atomic-registration@example.com"
+    ).one()
+    action = app.db.session.query(AccountActionToken).one()
+    job = app.db.session.query(NotificationOutbox).one()
+    assert action.user_id == user.id
+    assert action.purpose == "verify_registration"
+    assert job.event_type == "account_action_delivery"
+    assert job.payload["action_id"] == action.delivery_id
+    assert "token" not in json.dumps(job.payload).lower()
+    send.assert_not_called()
+
+
+def test_registration_queue_failure_rolls_back_user_and_action(app):
+    payload = {
+        "email": "rollback-registration@example.com",
+        "password1": "Valid_password1",
+        "password2": "Valid_password1",
+        "g-recaptcha-response": "test",
+    }
+    rejected = DeliveryResult("email", DeliveryState.REJECTED, "outbox_full")
+    with app.test_request_context(
+        "/accounts/user", method="POST", json=payload
+    ), mock.patch.object(
+        views, "verify_recaptcha", return_value=True
+    ), mock.patch.object(
+        views, "enqueue_notification", return_value=rejected
+    ):
+        _, status, _ = views.UserManagementView().post()
+
+    assert status == 503
+    assert app.db.session.query(User).count() == 0
+    assert app.db.session.query(AccountActionToken).count() == 0
+    assert app.db.session.query(NotificationOutbox).count() == 0
+
+
+def test_concurrent_absent_registration_matches_existing_account_outcome(
+    app, monkeypatch
+):
+    if app.db.engine.dialect.name != "postgresql":
+        if os.environ.get("REQUIRE_POSTGRES_SECURITY_TESTS") == "1":
+            pytest.fail("PostgreSQL security tests were required but not configured")
+        pytest.skip("PostgreSQL row and unique-conflict semantics required")
+
+    payload = {
+        "email": "concurrent-registration@example.com",
+        "password1": "Valid_password1",
+        "password2": "Valid_password1",
+        "g-recaptcha-response": "test",
+    }
+    arrivals = Barrier(2)
+    original_create_user = app.security_service.create_user
+
+    def synchronized_create_user(*args, **kwargs):
+        arrivals.wait(timeout=10)
+        return original_create_user(*args, **kwargs)
+
+    monkeypatch.setitem(app.config, "WTF_CSRF_ENABLED", False)
+    monkeypatch.setattr(views, "verify_recaptcha", lambda _token: True)
+    monkeypatch.setattr(
+        app.security_service, "create_user", synchronized_create_user
+    )
+    app.db.session.remove()
+
+    def register():
+        response = app.test_client().post(
+            "/accounts/user", json=payload, base_url="https://localhost"
+        )
+        return response.status_code, response.get_json()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        responses = list(executor.map(lambda _index: register(), range(2)))
+
+    expected = (202, {"message": views.ACCOUNT_ACCEPTED_MESSAGE})
+    assert responses == [expected, expected]
+    assert app.db.session.query(User).filter_by(
+        email="concurrent-registration@example.com"
+    ).count() == 1
+    assert app.db.session.query(AccountActionToken).count() == 1
+    jobs = app.db.session.query(NotificationOutbox).all()
+    assert sorted(job.event_type for job in jobs) == [
+        "account_action_delivery",
+        "template_email",
+    ]
+
+
+def test_registration_inspection_does_not_mutate_or_swap_session(app, monkeypatch):
+    target_id = create_user(
+        app,
+        user_id=201,
+        email="pending@example.com",
+        fs_uniquifier="pending-session",
+        confirmed=False,
+    )
+    other_id = create_user(
+        app,
+        user_id=202,
+        email="other-viewer@example.com",
+        fs_uniquifier="other-viewer-session",
+    )
+    token = issue_email_action(
+        app, target_id, "verify_registration", "pending@example.com"
+    )
+    monkeypatch.setitem(app.config, "SESSION_COOKIE_PATH", "/")
+    client = app.test_client()
+    monkeypatch.setitem(app.config, "WTF_CSRF_ENABLED", False)
+    clear_cached_user()
+    login = client.post(
+        "/accounts/user/login",
+        json={
+            "email": "other-viewer@example.com",
+            "password": "Valid_password1",
+        },
+        base_url="https://localhost",
+    )
+    assert login.status_code == 200
+    clear_cached_user()
+    with client.session_transaction() as browser_session:
+        session_before = dict(browser_session)
+
+    clear_cached_user()
+    response = client.post(
+        "/accounts/verify",
+        json={"token": token},
+        base_url="https://localhost",
+    )
+    clear_cached_user()
+
+    assert response.status_code == 200
+    assert response.get_json()["flow"] == "verify_registration"
+    with client.session_transaction() as browser_session:
+        assert dict(browser_session) == session_before
+    with app.session_scope() as session:
+        target = session.query(User).filter_by(id=target_id).one()
+        assert target.confirmed_at is None
+        assert session.query(AccountActionToken).count() == 1
+        assert session.query(User).filter_by(id=other_id).one().confirmed_at is not None
+
+
+
+def test_email_change_inspection_does_not_apply_target(app):
+    user_id = create_user(
+        app,
+        user_id=211,
+        email="inspect-current@example.com",
+        fs_uniquifier="inspect-email-change-session",
+    )
+    token = issue_email_action(
+        app, user_id, "change_email", "inspect-target@example.com"
+    )
+
+    with app.test_request_context(method="POST", json={"token": token}):
+        reset_request_login_state()
+        response, status = views.VerifyEmailView().post()
+        assert status == 200
+        assert response == {
+            "flow": "change_email",
+            "email": "inspect-target@example.com",
+        }
+        assert not current_user.is_authenticated
+        reset_request_login_state()
+
+    user = app.db.session.query(User).filter_by(id=user_id).one()
+    assert str(user.email) == "inspect-current@example.com"
+    assert app.db.session.query(AccountActionToken).count() == 1
+
+
+def test_registration_put_requires_csrf_consumes_once_and_logs_in_after_commit(
+    app, monkeypatch
+):
+    user_id = create_user(
+        app,
+        user_id=203,
+        email="csrf-registration@example.com",
+        fs_uniquifier="csrf-registration-session",
+        confirmed=False,
+    )
+    token = issue_email_action(
+        app,
+        user_id,
+        "verify_registration",
+        "csrf-registration@example.com",
+    )
+    monkeypatch.setitem(app.config, "SESSION_COOKIE_PATH", "/")
+    rejected_client = app.test_client()
+
+    clear_cached_user()
+    rejected = rejected_client.put(
+        "/accounts/verify",
+        json={"token": token},
+        base_url="https://localhost",
+    )
+    assert rejected.status_code == 400
+    user = app.db.session.query(User).filter_by(id=user_id).one()
+    assert user.confirmed_at is None
+    assert app.db.session.query(AccountActionToken).count() == 1
+
+    client = app.test_client()
+    clear_cached_user()
+    g.pop("csrf_token", None)
+    csrf = client.get("/accounts/csrf", base_url="https://localhost").get_json()[
+        "csrf"
+    ]
+    clear_cached_user()
+    accepted = client.put(
+        "/accounts/verify",
+        json={"token": token},
+        headers={
+            "X-CSRFToken": csrf,
+            "Referer": "https://localhost/accounts/csrf",
+        },
+        base_url="https://localhost",
+    )
+    assert accepted.status_code == 200, accepted.get_json()
+    with client.session_transaction() as browser_session:
+        assert browser_session["_user_id"] == "csrf-registration-session"
+    clear_cached_user()
+
+    user = app.db.session.query(User).filter_by(id=user_id).one()
+    assert user.confirmed_at is not None
+    assert app.db.session.query(AccountActionToken).count() == 0
+    replay = client.put(
+        "/accounts/verify",
+        json={"token": token},
+        headers={
+            "X-CSRFToken": csrf,
+            "Referer": "https://localhost/accounts/csrf",
+        },
+        base_url="https://localhost",
+    )
+    assert replay.status_code == 400
+    assert replay.get_json() == {
+        "message": "Invalid or expired account action token"
+    }
+    clear_cached_user()
+
+
+def test_registration_action_rejects_missing_row_cross_purpose_and_subject_mismatch(
+    app,
+):
+    first_id = create_user(
+        app,
+        user_id=204,
+        email="first-pending@example.com",
+        fs_uniquifier="first-pending-session",
+        confirmed=False,
+    )
+    second_id = create_user(
+        app,
+        user_id=205,
+        email="second-pending@example.com",
+        fs_uniquifier="second-pending-session",
+        confirmed=False,
+    )
+    token = issue_email_action(
+        app,
+        first_id,
+        "verify_registration",
+        "first-pending@example.com",
+    )
+    with app.session_scope() as session:
+        with pytest.raises(AccountActionTokenError):
+            app.security_service.verify_account_action_token(
+                session, token, "change_email"
+            )
+        action = session.query(AccountActionToken).one()
+        action.user_id = second_id
+        session.commit()
+        with pytest.raises(AccountActionTokenError):
+            app.security_service.verify_account_action_token(
+                session, token, "verify_registration"
+            )
+        session.delete(action)
+        session.commit()
+        with pytest.raises(AccountActionTokenError):
+            app.security_service.verify_account_action_token(
+                session, token, "verify_registration"
+            )
+
+
+def test_registration_action_rejects_exact_expiry_and_changed_target(app):
+    user_id = create_user(
+        app,
+        user_id=206,
+        email="expiring-pending@example.com",
+        fs_uniquifier="expiring-pending-session",
+        confirmed=False,
+    )
+    issued_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    token = issue_email_action(
+        app,
+        user_id,
+        "verify_registration",
+        "expiring-pending@example.com",
+        now=issued_at,
+    )
+    with app.session_scope() as session:
+        with pytest.raises(AccountActionTokenError):
+            app.security_service.verify_account_action_token(
+                session,
+                token,
+                "verify_registration",
+                now=issued_at + timedelta(hours=24),
+            )
+        user = session.query(User).filter_by(id=user_id).one()
+        user.email = "changed-pending@example.com"
+        session.commit()
+        with pytest.raises(AccountActionTokenError):
+            app.security_service.verify_account_action_token(
+                session,
+                token,
+                "verify_registration",
+                now=issued_at + timedelta(hours=1),
+            )
+        assert session.query(AccountActionToken).count() == 1
+
+
+def test_email_change_applies_only_bound_target_and_replays_fail(app):
+    user_id = create_user(
+        app,
+        user_id=207,
+        email="current@example.com",
+        fs_uniquifier="email-change-session",
+    )
+    token = issue_email_action(
+        app, user_id, "change_email", "bound-target@example.com"
+    )
+
+    with app.test_request_context(method="PUT", json={"token": token}):
+        reset_request_login_state()
+        response, status = views.VerifyEmailView().put()
+        assert status == 200
+        assert response["flow"] == "change_email"
+        reset_request_login_state()
+
+    user = app.db.session.query(User).filter_by(id=user_id).one()
+    assert str(user.email) == "bound-target@example.com"
+    assert app.db.session.query(AccountActionToken).count() == 0
+    with app.test_request_context(method="PUT", json={"token": token}):
+        reset_request_login_state()
+        response, status = views.VerifyEmailView().put()
+        assert status == 400
+        assert response == {
+            "message": "Invalid or expired account action token"
+        }
+        reset_request_login_state()
+
+
+def test_email_change_target_claimed_before_consume_rolls_back(app):
+    user_id = create_user(
+        app,
+        user_id=208,
+        email="change-owner@example.com",
+        fs_uniquifier="change-owner-session",
+    )
+    token = issue_email_action(
+        app, user_id, "change_email", "newly-claimed@example.com"
+    )
+    create_user(
+        app,
+        user_id=209,
+        email="newly-claimed@example.com",
+        fs_uniquifier="target-owner-session",
+    )
+
+    with app.test_request_context(method="PUT", json={"token": token}):
+        reset_request_login_state()
+        response, status = views.VerifyEmailView().put()
+        assert status == 400
+        assert response == {
+            "message": "Invalid or expired account action token"
+        }
+        reset_request_login_state()
+
+    with app.session_scope() as session:
+        user = session.query(User).filter_by(id=user_id).one()
+        assert str(user.email) == "change-owner@example.com"
+        action = session.query(AccountActionToken).one()
+        verified_user, verified_action = (
+            app.security_service.verify_account_action_token(
+                session, token, "change_email"
+            )
+        )
+        assert verified_user.id == user_id
+        assert verified_action.id == action.id
+
+
+def test_verification_resend_replaces_action_and_delivery(app):
+    user_id = create_user(
+        app,
+        user_id=210,
+        email="resend-pending@example.com",
+        fs_uniquifier="resend-pending-session",
+        confirmed=False,
+    )
+    original = issue_email_action(
+        app,
+        user_id,
+        "verify_registration",
+        "resend-pending@example.com",
+    )
+    original_action = app.db.session.query(AccountActionToken).one()
+    environment = notifications.request_environment("localhost")
+    notifications.enqueue_notification(
+        "account_action_delivery",
+        {"action_id": original_action.delivery_id, **environment},
+        dedupe_key=f"account-action-delivery:{original_action.delivery_id}",
+    )
+    original_job = app.db.session.query(NotificationOutbox).one()
+    original_job.state = "retry"
+    original_job.available_at = datetime.utcnow() + timedelta(hours=1)
+    app.db.session.commit()
+    result = notifications.enqueue_account_request(
+        "verification_resend_request",
+        "resend-pending@example.com",
+        "localhost",
+    )
+    assert result.state == DeliveryState.QUEUED
+    claim = notifications.claim_notification()
+    assert notifications._prepare_verification_resend(*claim) is None
+
+    action = app.db.session.query(AccountActionToken).one()
+    replacement = app.security_service.derive_account_action_token(action)
+    assert replacement != original
+    jobs = app.db.session.query(NotificationOutbox).order_by(
+        NotificationOutbox.id
+    ).all()
+    assert jobs[0].state == "suppressed"
+    assert jobs[0].payload == {}
+    assert jobs[0].last_error == "action_replaced"
+    job = jobs[1]
+    assert job.event_type == "account_action_delivery"
+    assert job.payload["action_id"] == action.delivery_id
+    assert original not in json.dumps(job.payload)
+    with pytest.raises(AccountActionTokenError):
+        app.security_service.verify_account_action_token(
+            app.db.session, original, "verify_registration"
+        )
+    user, current = app.security_service.verify_account_action_token(
+        app.db.session, replacement, "verify_registration"
+    )
+    assert user.id == user_id
+    assert current.id == action.id
+
+
+def test_account_verification_migration_is_single_head_and_legacy_free():
+    from apigateway import models, notifications as notification_module, services
+
+    versions = Path(__file__).parents[2] / "migrations" / "versions"
+    revisions = {}
+    for path in versions.glob("*.py"):
+        tree = ast.parse(path.read_text())
+        values = {}
+        for node in tree.body:
+            if (
+                isinstance(node, (ast.Assign, ast.AnnAssign))
+                and isinstance(node.value, ast.Constant)
+            ):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                for target in targets:
+                    if isinstance(target, ast.Name):
+                        values[target.id] = node.value.value
+        revisions[values["revision"]] = values.get("down_revision")
+    heads = set(revisions) - {parent for parent in revisions.values() if parent}
+    assert heads == {"d4c3b2a1908f"}
+    assert revisions["d4c3b2a1908f"] == "b8f2a6d41c73"
+
+    assert not hasattr(models, "EmailChangeRequest")
+    service = services.SecurityService
+    for method in (
+        "change_email",
+        "generate_email_token",
+        "verify_email_token",
+        "generate_token",
+        "verify_token",
+    ):
+        assert not hasattr(service, method)
+    production_source = inspect.getsource(notification_module)
+    assert "EmailChangeRequest" not in production_source
+    assert "email_change_verification" not in production_source

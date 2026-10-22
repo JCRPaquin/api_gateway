@@ -10,7 +10,9 @@ from apigateway import extensions
 
 def test_create_app_uses_gateway_database_extension(app):
     assert app.db is extensions.db
-    assert app.config["SQLALCHEMY_DATABASE_URI"] == "sqlite:///:memory:"
+    assert app.config["SQLALCHEMY_DATABASE_URI"] == os.environ.get(
+        "TEST_DATABASE_URI", "sqlite:///:memory:"
+    )
 
 
 def test_environment_boot_config_is_typed_without_logging_secrets():

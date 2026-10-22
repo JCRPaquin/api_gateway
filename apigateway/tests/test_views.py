@@ -5,13 +5,14 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import requests
+from flask import g
 from flask_login import current_user, login_user
 from marshmallow import ValidationError
 from werkzeug.exceptions import Unauthorized
 
 from apigateway import views
 from apigateway.email_templates import EmailChangedNotification
-from apigateway.models import AnonymousUser, EmailChangeRequest, User
+from apigateway.models import AccountActionToken, AnonymousUser, User
 from apigateway.schemas import bootstrap_response
 from apigateway.domains import canonicalize_domain
 from apigateway.utils import (
@@ -468,8 +469,9 @@ class TestChangeEmailView:
             login_user(authenticated_user)
             _, status_code = change_email_view.post()
             assert status_code == 202
-            assert action_mail.call_args.args[0] == "email_change_verification"
-            assert action_mail.call_args.args[1]["action_id"] > 0
+            assert action_mail.call_args.args[0] == "account_action_delivery"
+            action = app.db.session.query(AccountActionToken).one()
+            assert action_mail.call_args.args[1]["action_id"] == action.delivery_id
             assert action_mail.call_args.args[1]["ui_env"] == "ADS"
             assert action_mail.call_args.kwargs["commit"] is False
             notice_mail.assert_called_once_with(
@@ -540,55 +542,59 @@ class TestVerifyEmailView:
         return views.VerifyEmailView()
 
     @pytest.fixture
-    def authenticated_user(self, app):
+    def registration_action(self, app):
         with app.session_scope() as session:
-            user = User()
-            user.id = 123
-            user.active = True
-            user.confirmed_at = datetime.utcnow()
-            user.email = "test@gmail.com"
-            user.password = "Valid_password1"
-            user.fs_uniquifier = "unique_id"
+            user = User(
+                id=123,
+                active=True,
+                confirmed_at=None,
+                email="test@gmail.com",
+                password="Valid_password1",
+                fs_uniquifier="unique_id",
+            )
             session.add(user)
             session.commit()
-            yield user
-
-        with app.session_scope() as session:
-            session.delete(user)
+            token = app.security_service.issue_account_action_token(
+                session,
+                user_id=user.id,
+                purpose="verify_registration",
+                target_email="test@gmail.com",
+            )
             session.commit()
+        return token
 
-    @pytest.fixture
-    def email_change_request(self, app, authenticated_user):
-        with app.session_scope() as session:
-            request = EmailChangeRequest()
-            request.user_id = authenticated_user.id
-            request.new_email = "new_email@gmail.com"
-            session.add(request)
-            session.commit()
-            yield request
+    def test_post_is_read_only(self, app, verify_email_view, registration_action):
+        with app.test_request_context(
+            method="POST", json={"token": registration_action}
+        ):
+            g.pop("_login_user", None)
+            response, status_code = verify_email_view.post()
+            assert status_code == 200
+            assert response["flow"] == "verify_registration"
+            assert not current_user.is_authenticated
+        user = app.db.session.query(User).filter_by(id=123).one()
+        assert user.confirmed_at is None
+        assert app.db.session.query(AccountActionToken).count() == 1
 
-        with app.session_scope() as session:
-            session.delete(request)
-            session.commit()
-
-    def test_get_valid_token(
-        self, app, verify_email_view, authenticated_user, email_change_request
+    def test_put_consumes_registration_action(
+        self, app, verify_email_view, registration_action
     ):
-        with app.test_request_context():
-            email_change_request.token = app.security_service.generate_email_token()
-            login_user(authenticated_user)
-            response, status_code = verify_email_view.get(email_change_request.token)
+        with app.test_request_context(
+            method="PUT", json={"token": registration_action}
+        ):
+            response, status_code = verify_email_view.put()
             assert status_code == 200
-            assert response["message"] == "success"
+            assert response["flow"] == "verify_registration"
+        user = app.db.session.query(User).filter_by(id=123).one()
+        assert user.confirmed_at is not None
+        assert app.db.session.query(AccountActionToken).count() == 0
 
-    def test_get_no_associated_token(self, app, verify_email_view, authenticated_user):
-        with app.test_request_context():
-            login_user(authenticated_user)
-            _, status_code = verify_email_view.get(app.security_service.generate_email_token())
-            assert status_code == 200
-
-    def test_get_invalid_token(self, app, verify_email_view, authenticated_user):
-        with app.test_request_context():
-            login_user(authenticated_user)
-            with pytest.raises(ValueError, match="unknown verification token"):
-                verify_email_view.get("invalid_token")
+    def test_invalid_token_gets_generic_response(self, app, verify_email_view):
+        with app.test_request_context(
+            method="POST", json={"token": "invalid-token"}
+        ):
+            response, status_code = verify_email_view.post()
+        assert status_code == 400
+        assert response == {
+            "message": "Invalid or expired account action token"
+        }

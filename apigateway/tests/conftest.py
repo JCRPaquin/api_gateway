@@ -1,3 +1,4 @@
+import os
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -11,7 +12,9 @@ from apigateway.models import base_model
 def app(request):
     app = create_app(
         **{
-            "SQLALCHEMY_DATABASE_URI": "sqlite:///:memory:",
+            "SQLALCHEMY_DATABASE_URI": os.environ.get(
+                "TEST_DATABASE_URI", "sqlite:///:memory:"
+            ),
             "SQLALCHEMY_ECHO": False,
             "TESTING": True,
             "DEBUG": False,

@@ -205,7 +205,7 @@ pasting the link below into your browser:
 
 {endpoint}
 
-This link is only valid for the next 24 hours. 
+This link is valid only for a limited time.
 
 If you didn't request this, you can safely ignore this email.
 
@@ -219,7 +219,7 @@ please confirm your email address:</p>
 
 {open_tag}<a href="{endpoint}">{endpoint}</a></p>
 
-{open_tag}This link is only valid for the next 24 hours.</p>
+{open_tag}This link is valid only for a limited time.</p>
 
 {open_tag}If you didn't request this, you can safely ignore this email.</p>
 
@@ -238,7 +238,7 @@ please copy and paste the link below into your browser:
 
 {endpoint}
 
-This link is only valid for the next 24 hours.
+This link is valid only for a limited time.
 
 If you didn't request this, you can safely ignore this email.
 
@@ -252,7 +252,7 @@ If you didn't request this, you can safely ignore this email.
 
 {open_tag}<a href="{endpoint}">{endpoint}</a></p>
 
-{open_tag}This link is only valid for the next 24 hours.</p>
+{open_tag}This link is valid only for a limited time.</p>
 
 {open_tag}If you didn't request this, you can safely ignore this email.</p>
 

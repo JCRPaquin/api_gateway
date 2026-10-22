@@ -27,7 +27,7 @@ from flask_limiter.extension import LimitDecorator
 from flask_limiter.util import get_remote_address
 from flask_login import current_user
 from flask_security import Security, SQLAlchemyUserDatastore
-from itsdangerous import URLSafeSerializer, URLSafeTimedSerializer
+from itsdangerous import URLSafeSerializer
 from kafka import KafkaProducer
 from redis import Redis, StrictRedis
 from redis.exceptions import ConnectionError, TimeoutError
@@ -40,7 +40,6 @@ from apigateway.domains import canonicalize_email
 from apigateway.exceptions import (
     AccountActionTokenError,
     NoClientError,
-    NotFoundError,
     ValidationError,
 )
 from apigateway.models import (
@@ -1244,8 +1243,8 @@ class CacheService(GatewayService, Cache):
 class SecurityService(GatewayService, Security):
     """A service for managing user authentication and authorization.
 
-    This service provides methods for creating and managing users and roles, changing passwords and email addresses,
-    and generating and verifying email verification tokens.
+    This service creates and manages users and roles, changes credentials, and
+    issues and verifies purpose-bound account-action capabilities.
 
 
     """
@@ -1292,7 +1291,6 @@ class SecurityService(GatewayService, Security):
             anonymous_user=AnonymousUser,
         )
 
-        self._token_serializer = URLSafeTimedSerializer(self.get_service_config("SECRET_KEY"))
         self._account_action_serializer = URLSafeSerializer(
             self.get_service_config("SECRET_KEY")
         )
@@ -1393,41 +1391,12 @@ class SecurityService(GatewayService, Security):
 
         return True
 
-    def change_email(self, user: User, email: str) -> User:
-        """
-        Change the email of a user.
 
-        Args:
-            user (User): The user object to update.
-            email (str): The new email address for the user.
-
-        Returns:
-            User: The updated user object.
-        """
-        email = self._mail_util.validate(canonicalize_email(email))
-
-        user = self.datastore.db.session.merge(user)
-        user.email = email
-        self.datastore.commit()
-
-        return user
-
-    def generate_email_token(self, user_id: str = None) -> str:
-        """Generate a legacy email verification token."""
-        if user_id is None:
-            user_id = current_user.id
-        return self.generate_token(
-            user_id, salt=self.get_service_config("VERIFY_EMAIL_SALT")
-        )
-
-    def generate_token(self, content: str, salt: str):
-        """Generate a legacy email token."""
-        return self._token_serializer.dumps(content, salt=salt)
 
     @staticmethod
     def account_action_token_digest(token: str) -> str:
         """Return the complete bearer token's SHA-256 digest."""
-        if not isinstance(token, str) or not token:
+        if not isinstance(token, str) or not token or len(token) > 4096:
             raise AccountActionTokenError()
         try:
             return hashlib.sha256(token.encode("utf-8")).hexdigest()
@@ -1511,15 +1480,19 @@ class SecurityService(GatewayService, Security):
         )
         if locked_user is None:
             raise ValueError("account action user does not exist")
+        current_email = self.normalize_account_email(str(locked_user.email))
+        if locked_user.is_anonymous_bootstrap_user or not locked_user.active:
+            raise ValueError("user is not eligible for account actions")
         if purpose == "password_reset":
-            if (
-                locked_user.is_anonymous_bootstrap_user
-                or not locked_user.active
-                or locked_user.confirmed_at is None
-            ):
+            if locked_user.confirmed_at is None:
                 raise ValueError("user is not eligible for password reset")
-            if target_email != self.normalize_account_email(str(locked_user.email)):
+            if target_email != current_email:
                 raise ValueError("password reset target does not match the user")
+        elif purpose == "verify_registration":
+            if locked_user.confirmed_at is not None or target_email != current_email:
+                raise ValueError("user is not eligible for registration verification")
+        elif locked_user.confirmed_at is None or target_email == current_email:
+            raise ValueError("user is not eligible for email change")
         state_digest = self._account_action_state_digest(locked_user, purpose)
 
         issued_at = self._utc_datetime(now or datetime.now(timezone.utc))
@@ -1603,7 +1576,7 @@ class SecurityService(GatewayService, Security):
     def _decode_account_action_token(self, token: str, purpose: str) -> dict:
         if purpose not in self.ACCOUNT_ACTION_PURPOSES:
             raise AccountActionTokenError()
-        if not isinstance(token, str) or not token:
+        if not isinstance(token, str) or not token or len(token) > 4096:
             raise AccountActionTokenError()
         try:
             payload = self._account_action_serializer.loads(
@@ -1689,10 +1662,18 @@ class SecurityService(GatewayService, Security):
             raise AccountActionTokenError()
         if not hmac.compare_digest(current_state_digest, action.state_digest):
             raise AccountActionTokenError()
+        if not user.active or user.is_anonymous_bootstrap_user:
+            raise AccountActionTokenError()
         if purpose == "password_reset" and (
-            not user.active
-            or user.confirmed_at is None
-            or current_email != action.target_email
+            user.confirmed_at is None or current_email != action.target_email
+        ):
+            raise AccountActionTokenError()
+        if purpose == "verify_registration" and (
+            user.confirmed_at is not None or current_email != action.target_email
+        ):
+            raise AccountActionTokenError()
+        if purpose == "change_email" and (
+            user.confirmed_at is None or current_email == action.target_email
         ):
             raise AccountActionTokenError()
 
@@ -1703,22 +1684,6 @@ class SecurityService(GatewayService, Security):
             raise AccountActionTokenError()
         return user, action
 
-    def verify_email_token(self, token: str) -> User:
-        """Verify a legacy email token."""
-        salt = self.get_service_config("VERIFY_EMAIL_SALT")
-        return self.verify_token(token, salt)
-
-    def verify_token(self, token: str, salt: str) -> User:
-        """Verify a legacy email token and return its user."""
-        try:
-            user_id = self._token_serializer.loads(token, max_age=86400, salt=salt)
-        except Exception:
-            self._logger.warning("Verification token rejected")
-            raise ValueError("unknown verification token")
-        user: User = User.query.filter_by(id=user_id).first()
-        if user is None:
-            raise NotFoundError("no user associated with that verification token")
-        return user
 
 
 class KafkaProducerService(GatewayService):

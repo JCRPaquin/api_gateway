@@ -16,6 +16,8 @@ env:
   PGHOST: postgres
   PGPORT: 5432
   SQLALCHEMY_DATABASE_URI: "postgresql://user:password@postgres:5432/gateway"
+  TEST_DATABASE_URI: "postgresql://user:password@postgres:5432/gateway"
+  REQUIRE_POSTGRES_SECURITY_TESTS: "1"
   REDIS_SERVICE_URL: "redis://redis:6379/0"
   LIMITER_SERVICE_STORAGE_URI: "redis://redis:6379/0"
   UV_PYTHON_DOWNLOADS: never

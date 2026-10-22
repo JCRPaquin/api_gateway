@@ -14,12 +14,7 @@ from apigateway import email_templates, extensions
 from apigateway.config import canonical_authority
 from apigateway.domains import canonicalize_email
 from apigateway.exceptions import AccountActionTokenError
-from apigateway.models import (
-    AccountActionToken,
-    EmailChangeRequest,
-    NotificationOutbox,
-    User,
-)
+from apigateway.models import AccountActionToken, NotificationOutbox, User
 from apigateway.utils import DeliveryResult, DeliveryState, send_email, send_feedback_email
 
 
@@ -290,7 +285,12 @@ def _prepare_password_reset(job_id: int, ownership: str) -> DeliveryResult | Non
         .with_for_update()
         .first()
     )
-    if user is None or user.is_anonymous_bootstrap_user or not user.confirmed_at:
+    if (
+        user is None
+        or user.is_anonymous_bootstrap_user
+        or not user.active
+        or not user.confirmed_at
+    ):
         return DeliveryResult("email", DeliveryState.SUPPRESSED, "account_ineligible")
 
     # The user lock serializes replacement with delivery. The persisted action
@@ -343,6 +343,204 @@ def _prepare_password_reset(job_id: int, ownership: str) -> DeliveryResult | Non
     return None
 
 
+def _prepare_verification_resend(
+    job_id: int, ownership: str
+) -> DeliveryResult | None:
+    """Replace an unconfirmed account's verification action before delivery."""
+    session = extensions.db.session
+    job = (
+        session.query(NotificationOutbox)
+        .filter_by(id=job_id, state="processing", ownership_token=ownership)
+        .with_for_update()
+        .first()
+    )
+    if job is None:
+        session.rollback()
+        return None
+
+    payload = job.payload
+    user = (
+        session.query(User)
+        .filter_by(email=canonicalize_email(payload["email"]))
+        .with_for_update()
+        .first()
+    )
+    if (
+        user is None
+        or user.is_anonymous_bootstrap_user
+        or not user.active
+        or user.confirmed_at is not None
+    ):
+        return DeliveryResult("email", DeliveryState.SUPPRESSED, "account_ineligible")
+
+    previous_action = (
+        session.query(AccountActionToken)
+        .filter_by(user_id=user.id, purpose="verify_registration")
+        .with_for_update()
+        .first()
+    )
+    if previous_action is not None:
+        previous_job = (
+            session.query(NotificationOutbox)
+            .filter_by(
+                dedupe_key=(
+                    f"account-action-delivery:{previous_action.delivery_id}"
+                )
+            )
+            .with_for_update()
+            .first()
+        )
+        if previous_job is not None and previous_job.state in ("pending", "retry"):
+            previous_job.state = "suppressed"
+            previous_job.payload = {}
+            previous_job.payload_size = 0
+            previous_job.claimed_at = None
+            previous_job.ownership_token = None
+            previous_job.dedupe_key = None
+            previous_job.terminal_at = datetime.utcnow()
+            previous_job.last_error = "action_replaced"
+
+
+    extensions.security_service.issue_account_action_token(
+        session,
+        user_id=user.id,
+        purpose="verify_registration",
+        target_email=str(user.email),
+    )
+    action = session.query(AccountActionToken).filter_by(
+        user_id=user.id, purpose="verify_registration"
+    ).one()
+    delivery_payload = {
+        "action_id": action.delivery_id,
+        "ui_env": payload["ui_env"],
+        "ui_url": payload["ui_url"],
+        "verify_url": payload["verify_url"],
+    }
+    delivery_size = _payload_size(delivery_payload)
+    active_bytes = (
+        session.query(func.coalesce(func.sum(NotificationOutbox.payload_size), 0))
+        .filter(NotificationOutbox.state.in_(_ACTIVE_STATES))
+        .scalar()
+    )
+    if active_bytes - job.payload_size + delivery_size > current_app.config.get(
+        "MAIL_OUTBOX_MAX_ACTIVE_PAYLOAD_BYTES", 33_554_432
+    ):
+        session.rollback()
+        return DeliveryResult(
+            "email", DeliveryState.RETRYABLE_FAILURE, "outbox_payload_full"
+        )
+
+    job.event_type = "account_action_delivery"
+    job.payload = delivery_payload
+    job.payload_size = delivery_size
+    job.state = "pending"
+    job.attempts = 0
+    job.available_at = datetime.utcnow()
+    job.claimed_at = None
+    job.ownership_token = None
+    job.last_error = None
+    job.dedupe_key = f"account-action-delivery:{action.delivery_id}"
+    session.commit()
+    return None
+
+
+def _account_action_url(verify_url: str, purpose: str, token: str) -> str:
+    """Build the UI fragment; the UI submits its token only in an API JSON body."""
+    flow = "register" if purpose == "verify_registration" else "change-email"
+    parsed = urlsplit(verify_url)
+    prefix = parsed.fragment.rstrip("/")
+    fragment = f"{prefix}/{flow}/{token}" if prefix else f"{flow}/{token}"
+    return urlunsplit(parsed._replace(fragment=fragment))
+
+
+def _deliver_email_account_action(payload: dict) -> DeliveryResult:
+    """Lock and deliver only the exact current registration/email-change action."""
+    session = extensions.db.session
+    candidate = (
+        session.query(AccountActionToken.user_id, AccountActionToken.purpose)
+        .filter_by(delivery_id=payload["action_id"])
+        .first()
+    )
+    if candidate is None or candidate.purpose not in {
+        "verify_registration",
+        "change_email",
+    }:
+        return DeliveryResult("email", DeliveryState.SUPPRESSED, "action_missing")
+    user = (
+        session.query(User)
+        .filter_by(id=candidate.user_id)
+        .with_for_update()
+        .first()
+    )
+    if user is None:
+        return DeliveryResult("email", DeliveryState.SUPPRESSED, "action_missing")
+    action = (
+        session.query(AccountActionToken)
+        .filter_by(delivery_id=payload["action_id"], purpose=candidate.purpose)
+        .with_for_update()
+        .first()
+    )
+    if action is None or action.user_id != user.id:
+        return DeliveryResult("email", DeliveryState.SUPPRESSED, "action_missing")
+    try:
+        token = extensions.security_service.derive_account_action_token(action)
+        extensions.security_service.verify_account_action_token(
+            session, token, action.purpose
+        )
+        current_email = extensions.security_service.normalize_account_email(
+            str(user.email)
+        )
+        if (
+            not user.active
+            or user.is_anonymous_bootstrap_user
+            or (
+                action.purpose == "verify_registration"
+                and (
+                    user.confirmed_at is not None
+                    or action.target_email != current_email
+                )
+            )
+            or (
+                action.purpose == "change_email"
+                and (
+                    user.confirmed_at is None
+                    or action.target_email == current_email
+                    or session.query(User.id)
+                    .filter(
+                        User.email == action.target_email,
+                        User.id != user.id,
+                    )
+                    .first()
+                    is not None
+                )
+            )
+        ):
+            raise AccountActionTokenError()
+    except (AccountActionTokenError, TypeError, ValueError):
+        return DeliveryResult("email", DeliveryState.SUPPRESSED, "action_invalid")
+
+    template = (
+        email_templates.WelcomeVerificationEmail
+        if action.purpose == "verify_registration"
+        else email_templates.VerificationEmail
+    )
+    recipient = (
+        current_email
+        if action.purpose == "verify_registration"
+        else action.target_email
+    )
+    return send_email(
+        current_app.config["MAIL_DEFAULT_SENDER"],
+        recipient,
+        template,
+        verification_url=_account_action_url(
+            payload["verify_url"], action.purpose, token
+        ),
+        ui_env=payload["ui_env"],
+        ui_url=payload["ui_url"],
+    )
+
+
 def _password_reset_url(verify_url: str, token: str) -> str:
     parsed = urlsplit(verify_url)
     prefix = parsed.fragment.rstrip("/")
@@ -363,30 +561,6 @@ def _deliver(job: NotificationOutbox) -> DeliveryResult:
             template,
             ui_env=payload["ui_env"],
             ui_url=payload["ui_url"],
-        )
-    if job.event_type == "verification_resend_request":
-        user = session.query(User).filter_by(email=canonicalize_email(payload["email"])).first()
-        if user is None or user.is_anonymous_bootstrap_user or user.confirmed_at:
-            return DeliveryResult("email", DeliveryState.SUPPRESSED, "account_ineligible")
-        token = extensions.security_service.generate_email_token(user.id)
-        return send_email(
-            current_app.config["MAIL_DEFAULT_SENDER"],
-            user.email,
-            email_templates.WelcomeVerificationEmail,
-            verification_url=f"{payload['verify_url']}/register/{token}",
-            ui_env=payload["ui_env"],
-            ui_url=payload["ui_url"],
-        )
-    if job.event_type == "welcome_email":
-        user = session.query(User).filter_by(id=payload["user_id"]).first()
-        if user is None:
-            return DeliveryResult("email", DeliveryState.SUPPRESSED, "account_ineligible")
-        token = extensions.security_service.generate_email_token(user.id)
-        return send_email(
-            current_app.config["MAIL_DEFAULT_SENDER"], user.email,
-            email_templates.WelcomeVerificationEmail,
-            verification_url=f"{payload['verify_url']}/register/{token}",
-            ui_env=payload["ui_env"], ui_url=payload["ui_url"]
         )
     if job.event_type == "password_reset_action":
         candidate = (
@@ -427,16 +601,8 @@ def _deliver(job: NotificationOutbox) -> DeliveryResult:
             ui_env=payload["ui_env"],
             ui_url=payload["ui_url"],
         )
-    if job.event_type == "email_change_verification":
-        action = session.query(EmailChangeRequest).filter_by(id=payload["action_id"]).first()
-        if action is None:
-            return DeliveryResult("email", DeliveryState.SUPPRESSED, "action_missing")
-        return send_email(
-            current_app.config["MAIL_DEFAULT_SENDER"], action.new_email,
-            email_templates.VerificationEmail,
-            verification_url=f"{payload['verify_url']}/change-email/{action.token}",
-            ui_env=payload["ui_env"], ui_url=payload["ui_url"]
-        )
+    if job.event_type == "account_action_delivery":
+        return _deliver_email_account_action(payload)
     if job.event_type == "feedback_email":
         attachments = [
             (item["filename"], base64.b64decode(item["content"], validate=True))
@@ -531,8 +697,16 @@ def process_outbox_batch() -> int:
             if job is None:
                 extensions.db.session.rollback()
                 continue
-            if job.event_type == "password_reset_request":
-                result = _prepare_password_reset(job_id, ownership)
+            if job.event_type in {
+                "password_reset_request",
+                "verification_resend_request",
+            }:
+                prepare = (
+                    _prepare_password_reset
+                    if job.event_type == "password_reset_request"
+                    else _prepare_verification_resend
+                )
+                result = prepare(job_id, ownership)
                 if result is not None:
                     _finish(job_id, ownership, result)
                 processed += 1

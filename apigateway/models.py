@@ -154,15 +154,6 @@ class OAuth2Token(base_model, OAuth2TokenMixin):
         return self.issued_at + self.expires_in
 
 
-class EmailChangeRequest(base_model):
-    __tablename__ = "email_change_request"
-
-    id = sa.Column(sa.Integer, primary_key=True, autoincrement=True)
-    token = sa.Column(sa.String(255), unique=True)
-    user_id = sa.Column(sa.Integer(), sa.ForeignKey("user.id", ondelete="CASCADE"))
-    user = relationship("User")
-    new_email = sa.Column(sa.Text)
-
 
 class AccountActionToken(base_model):
     __tablename__ = "account_action_token"
@@ -187,7 +178,7 @@ class AccountActionToken(base_model):
         nullable=False,
     )
     purpose = sa.Column(sa.String(32), nullable=False)
-    target_email = sa.Column(sa.String(255), nullable=True)
+    target_email = sa.Column(sa.String(255), nullable=False)
     state_digest = sa.Column(sa.String(64), nullable=False)
     issued_at = sa.Column(sa.DateTime(timezone=True), nullable=False)
     expires_at = sa.Column(sa.DateTime(timezone=True), nullable=False)

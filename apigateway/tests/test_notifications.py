@@ -5,7 +5,11 @@ from urllib.parse import urlsplit
 import pytest
 
 from apigateway import notifications
-from apigateway.email_templates import AccountRegistrationAttemptEmail
+from apigateway.email_templates import (
+    AccountRegistrationAttemptEmail,
+    VerificationEmail,
+    WelcomeVerificationEmail,
+)
 from apigateway.models import AccountActionToken, NotificationOutbox, User
 from apigateway.utils import DeliveryResult, DeliveryState
 
@@ -301,3 +305,173 @@ def test_password_reset_stage_quota_failure_rolls_back_action(app):
     assert job.event_type == "password_reset_request"
     assert job.state == "retry"
     assert job.last_error == "outbox_payload_full"
+
+
+@pytest.mark.parametrize(
+    ("purpose", "confirmed", "target", "template"),
+    (
+        (
+            "verify_registration",
+            False,
+            "registration-delivery@example.org",
+            WelcomeVerificationEmail,
+        ),
+        (
+            "change_email",
+            True,
+            "changed-delivery@example.org",
+            VerificationEmail,
+        ),
+    ),
+)
+def test_email_account_action_delivery_derives_bearer_from_committed_action(
+    app, purpose, confirmed, target, template
+):
+    user = User(
+        email="registration-delivery@example.org",
+        fs_uniquifier=f"{purpose}-delivery-session",
+        active=True,
+        confirmed_at=datetime.utcnow() if confirmed else None,
+        password="Valid_password1",
+    )
+    app.db.session.add(user)
+    app.db.session.commit()
+    token = app.security_service.issue_account_action_token(
+        app.db.session,
+        user_id=user.id,
+        purpose=purpose,
+        target_email=target,
+    )
+    action = app.db.session.query(AccountActionToken).one()
+    environment = notifications.request_environment("localhost")
+    notifications.enqueue_notification(
+        "account_action_delivery",
+        {"action_id": action.delivery_id, **environment},
+        dedupe_key=f"account-action-delivery:{action.delivery_id}",
+        session=app.db.session,
+        commit=False,
+    )
+    app.db.session.commit()
+
+    job = app.db.session.query(NotificationOutbox).one()
+    assert token not in str(job.payload)
+    assert job.payload == {"action_id": action.delivery_id, **environment}
+    accepted = DeliveryResult("email", DeliveryState.SENT, "sent")
+    with mock.patch.object(
+        notifications, "send_email", return_value=accepted
+    ) as send:
+        assert notifications.process_outbox_batch() == 1
+
+    assert send.call_args.args[1] == target
+    assert send.call_args.args[2] is template
+    assert "24 hours" not in template.msg_plain
+    assert "24 hours" not in template.msg_html
+    delivery_url = send.call_args.kwargs["verification_url"]
+    parsed = urlsplit(delivery_url)
+    delivered_token = parsed.fragment.rsplit("/", 1)[1]
+    assert delivered_token not in parsed.path
+    assert delivered_token not in parsed.query
+    flow = "register" if purpose == "verify_registration" else "change-email"
+    assert parsed.fragment.endswith(f"/{flow}/{delivered_token}")
+    verified_user, verified_action = (
+        app.security_service.verify_account_action_token(
+            app.db.session, delivered_token, purpose
+        )
+    )
+    assert verified_user.id == user.id
+    assert verified_action.id == action.id
+    terminal = app.db.session.query(NotificationOutbox).one()
+    assert terminal.payload == {}
+
+
+def test_superseded_registration_delivery_is_suppressed(app):
+    user = User(
+        email="stale-registration@example.org",
+        fs_uniquifier="stale-registration-session",
+        active=True,
+        confirmed_at=None,
+        password="Valid_password1",
+    )
+    app.db.session.add(user)
+    app.db.session.commit()
+    app.security_service.issue_account_action_token(
+        app.db.session,
+        user_id=user.id,
+        purpose="verify_registration",
+        target_email=str(user.email),
+    )
+    first = app.db.session.query(AccountActionToken).one()
+    environment = notifications.request_environment("localhost")
+    notifications.enqueue_notification(
+        "account_action_delivery",
+        {"action_id": first.delivery_id, **environment},
+        dedupe_key=f"account-action-delivery:{first.delivery_id}",
+        session=app.db.session,
+        commit=False,
+    )
+    app.db.session.commit()
+
+    app.security_service.issue_account_action_token(
+        app.db.session,
+        user_id=user.id,
+        purpose="verify_registration",
+        target_email=str(user.email),
+    )
+    current = app.db.session.query(AccountActionToken).one()
+    notifications.enqueue_notification(
+        "account_action_delivery",
+        {"action_id": current.delivery_id, **environment},
+        dedupe_key=f"account-action-delivery:{current.delivery_id}",
+        session=app.db.session,
+        commit=False,
+    )
+    app.db.session.commit()
+
+    accepted = DeliveryResult("email", DeliveryState.SENT, "sent")
+    with mock.patch.object(
+        notifications, "send_email", return_value=accepted
+    ) as send:
+        assert notifications.process_outbox_batch() == 2
+    send.assert_called_once()
+    states = [
+        row.state
+        for row in app.db.session.query(NotificationOutbox)
+        .order_by(NotificationOutbox.id)
+        .all()
+    ]
+    assert states == ["suppressed", "sent"]
+
+
+def test_consumed_registration_delivery_is_suppressed(app):
+    user = User(
+        email="consumed-registration@example.org",
+        fs_uniquifier="consumed-registration-session",
+        active=True,
+        confirmed_at=None,
+        password="Valid_password1",
+    )
+    app.db.session.add(user)
+    app.db.session.commit()
+    app.security_service.issue_account_action_token(
+        app.db.session,
+        user_id=user.id,
+        purpose="verify_registration",
+        target_email=str(user.email),
+    )
+    action = app.db.session.query(AccountActionToken).one()
+    notifications.enqueue_notification(
+        "account_action_delivery",
+        {
+            "action_id": action.delivery_id,
+            **notifications.request_environment("localhost"),
+        },
+        session=app.db.session,
+        commit=False,
+    )
+    app.db.session.delete(action)
+    app.db.session.commit()
+
+    with mock.patch.object(notifications, "send_email") as send:
+        assert notifications.process_outbox_batch() == 1
+    send.assert_not_called()
+    assert app.db.session.query(NotificationOutbox).one().state == "suppressed"

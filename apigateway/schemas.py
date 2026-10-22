@@ -158,7 +158,7 @@ class ResetPasswordInitiateRequestSchema:
 
 @dataclass
 class AccountActionTokenRequestSchema:
-    token: str = field()
+    token: str = field(metadata={"validate": Length(min=1, max=4096)})
 
 
 @dataclass

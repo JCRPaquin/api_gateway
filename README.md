@@ -195,17 +195,26 @@ HTTP 503 response `Notification service unavailable` with `Retry-After: 60`.
 Disposable-domain policy entries and submitted domains are compared using
 trimmed, trailing-dot-free lowercase IDNA ASCII.
 
-Registration account creation and its welcome-email outbox row are committed
-atomically. Password reset is deliberately two-stage: the worker first claims
-the account-independent request, replaces the user's prior account-action
-token, and commits a requeued delivery event containing only that action's
-random stable delivery ID. A later claim locks and reloads that exact committed
-action before deriving its signed bearer in memory. Account-action rows contain
-only the bearer digest, state binding, expiry, and delivery identity; active or
-terminal outbox JSON never contains the bearer or bearer URL. The account-action
-migration invalidates and removes all legacy reset actions.
+New-account creation, its purpose-bound registration action, and the durable
+verification delivery row are committed atomically. Verification resends are
+deliberately two-stage: the account-independent request is committed first,
+then a worker locks the eligible unconfirmed user, replaces that user's prior
+registration action, and commits the requeued delivery. Password reset uses the
+same two-stage pattern. Delivery events contain only the action's random stable
+delivery ID and selected UI environment. A later claim locks and reloads that
+exact committed action before deriving its signed bearer in memory.
+Concurrent PostgreSQL registrations for the same previously absent canonical
+email are resolved at the typed email unique constraint. The losing transaction
+is rolled back before the committed winner is locked and reloaded, and the
+loser queues the same durable registration-attempt notice as any other
+existing-account request. Both callers receive the identical HTTP 202 response.
+Only the typed email-constraint conflict is recovered; unrelated database or
+outbox failures continue to return the generic HTTP 503 response.
+Account-action rows contain only the bearer digest, target and state binding,
+expiry, and delivery identity; active or terminal outbox JSON never contains a
+bearer or bearer URL.
 
-Apply the `notification_outbox` migration and run one or more workers:
+Apply migrations through `d4c3b2a1908f` and run one or more workers:
 
 ```bash
 apigateway notifications work
@@ -214,19 +223,25 @@ apigateway notifications work
 Workers claim one row at a time with lease ownership and `FOR UPDATE SKIP
 LOCKED` on PostgreSQL, retry transient failures up to
 `MAIL_OUTBOX_MAX_ATTEMPTS`, and retain scrubbed terminal metadata for bounded
-operator inspection. Reset generation is serialized per account, and delivery
-holds the current action lock through SMTP acceptance. Generation-specific
-dedupe IDs plus action replacement cause every stale delivery retry to be
-suppressed rather than send a superseded link. A crash after the action commit
-leaves its delivery event claimable; no SMTP call has occurred. Delivery is
-**at least once**, not exactly once: a crash after SMTP accepts a message but
-before the terminal-state commit may send the same still-current committed
-action again after lease recovery. It can never send an action superseded in
-the meantime.
-Forced resets triggered when a user logs in with a password that no longer
-meets policy use the same account-action row and durable delivery event. Their
-action replacement and outbox enqueue share the login transaction; reset mail
-is never sent directly by a request handler.
+operator inspection. Generation and delivery are serialized per account, and
+delivery holds the current action lock through SMTP acceptance.
+Generation-specific dedupe IDs plus action replacement cause stale
+registration, email-change, and password-reset delivery retries to be
+suppressed rather than send a superseded link. A
+crash after an action commit leaves its delivery event claimable; no SMTP call
+has occurred. Delivery is **at least once**, not exactly once: a crash after
+SMTP accepts a message but before the terminal-state commit may send the same
+still-current committed action again after lease recovery. It can never send
+an action superseded in the meantime.
+
+Email-change initiation locks the authenticated user and commits the
+target-bound action, verification delivery, and old-address notification in
+one transaction. Registration verification and email change delivery derive
+their bearers only from the committed exact action. Forced resets triggered
+when a user logs in with a password that no longer meets policy use the same
+account-action row and durable delivery event. Their action replacement and
+outbox enqueue share the login transaction; account-action mail is never sent
+directly by a request handler.
 
 Password-reset generation, delivery, and redemption use the same
 `User`-then-action lock order. The password mutation and deletion of the exact
@@ -261,15 +276,17 @@ are isolated by the effective limiter identity and scope, expire after
 clamp accounted work with `LIMITER_SERVICE_MAX_ACCOUNTED_SECONDS`. Total request
 cost is capped by `LIMITER_SERVICE_MAX_COST`. Explicit `cost=` callbacks opt out
 of adaptive charging.
-## Account-action tokens and password recovery
 
-Password recovery uses a one-time, purpose-bound account-action capability.
-Only a SHA-256 digest of the signed token is stored. The token is also bound
-with a keyed state digest to the current password hash, normalized email,
-active flag, and confirmation state. A later account-state change invalidates
-the pending reset. The default lifetime is 24 hours and can be changed with
-`SECURITY_SERVICE_ACCOUNT_ACTION_TOKEN_EXPIRES` (seconds). Reset email copy
-does not hard-code that default.
+## Account-action tokens and account verification
+
+Registration verification, email changes, and password recovery use one-time,
+purpose-bound account-action capabilities. Only a SHA-256 digest of each signed
+token is stored. Every token is bound to its numeric subject, exact canonical
+target email, purpose, current password hash, normalized current email, active
+flag, and confirmation state. A later account-state change invalidates the
+pending action. The default lifetime is 24 hours and can be changed with
+`SECURITY_SERVICE_ACCOUNT_ACTION_TOKEN_EXPIRES` (seconds). Email copy does not
+hard-code that default.
 
 The password-recovery API accepts credentials only in JSON request bodies:
 
@@ -285,6 +302,35 @@ Reset links put the bearer token in the UI URL fragment. The fragment is not
 sent in an HTTP request target; the UI submits it to the gateway in a
 CSRF-protected JSON request.
 
+Registration and email-change verification use one body-only API resource:
+
+- CSRF-protected `POST /accounts/verify` accepts JSON `{"token": "..."}` and
+  performs read-only validity and flow inspection. It never confirms an
+  account, changes an email, consumes an action, or changes the logged-in user.
+- CSRF-protected `PUT /accounts/verify` accepts the same bounded JSON body,
+  locks the subject and exact action, revalidates the target and account state,
+  applies only the authorized registration confirmation or canonical email
+  target, deletes that exact action, and commits once. Login occurs only after
+  the commit.
+- There is no GET verification credential route. The removed
+  `/accounts/verify/<token>` path is not parsed and returns 404/405.
+- `PUT /accounts/user/<email>/verify` is the separate, account-independent
+  verification-resend resource. An email path value is never interpreted as a
+  verification bearer.
+
+Email links carry the bearer only in the UI fragment, which browsers do not
+send in the HTTP request target. The UI must extract and remove the fragment,
+then send the bearer in the JSON body of `POST /accounts/verify` for inspection
+and `PUT /accounts/verify` only after explicit confirmation. API access and
+exception logs therefore see only the constant `/accounts/verify` target; the
+application does not log request bodies.
+
+Deploying revision `d4c3b2a1908f` drops `email_change_request`, makes action
+targets mandatory, and intentionally invalidates every registration and
+email-change link from the generic legacy-token workflow. Users must request
+new links. Downgrading recreates the legacy table empty and cannot restore old
+links.
+
 The former credential-bearing reset paths are removed. Deploying revision
 `b8f2a6d41c73` drops the legacy `password_change_request` table, so all reset
 links issued before the deployment are intentionally invalidated and users
@@ -296,9 +342,10 @@ OAuth token/client revocation, password hash, session-identifier rotation, and
 account-action deletion together. A failed transaction preserves all five
 pieces of prior state. On success, old browser sessions and bearer tokens are
 both invalid.
-SQLite tests cover transaction outcomes but do not prove row-lock
-serialization. Concurrent-consumer verification must run against PostgreSQL
-with two independent sessions.
+SQLite tests cover transaction outcomes but do not prove row-lock or
+unique-conflict serialization. Concurrent verification consumers and
+same-address registration creators must run against PostgreSQL with independent
+sessions.
 
 Responses from reset, login, change-password, change-email, verification,
 CSRF, bootstrap, and personal-token endpoints carry `Cache-Control: no-store`

@@ -55,7 +55,8 @@ SENSITIVE_ACCOUNT_ENDPOINTS = frozenset(
         "account_personal_token",
         "account_change_password",
         "account_change_email",
-        "account_verify_email",
+        "account_verify",
+        "account_verification_resend",
         "account_reset_password",
         "account_reset_password_verify",
     }
@@ -132,12 +133,18 @@ def register_hooks(app: Flask):
 
     @app.before_request
     def make_session_permanent():
+        # Capability inspection must not refresh or otherwise mutate a session.
+        if request.endpoint == "account_verify" and request.method == "POST":
+            return
         session.permanent = True
 
 
     @app.after_request
     def prevent_sensitive_response_storage(response):
-        if request.endpoint in SENSITIVE_ACCOUNT_ENDPOINTS:
+        if (
+            request.endpoint in SENSITIVE_ACCOUNT_ENDPOINTS
+            or request.path == "/accounts/verify"
+        ):
             response.headers["Cache-Control"] = "no-store"
             response.headers["Pragma"] = "no-cache"
         return response
@@ -294,9 +301,13 @@ def register_views(flask_api: Api):
 
     flask_api.add_resource(
         views.VerifyEmailView,
-        "/accounts/verify/<string:token>",
+        "/accounts/verify",
+        endpoint="account_verify",
+    )
+    flask_api.add_resource(
+        views.VerificationResendView,
         "/accounts/user/<string:email>/verify",
-        endpoint="account_verify_email",
+        endpoint="account_verification_resend",
     )
     flask_api.add_resource(
         views.ResetPasswordView,

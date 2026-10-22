@@ -11,18 +11,13 @@ from flask_restful import Resource, abort
 from flask_wtf.csrf import generate_csrf
 from marshmallow import ValidationError
 from sqlalchemy import or_
+from sqlalchemy.exc import IntegrityError
 from werkzeug.security import gen_salt
 
 from apigateway import email_templates as templates
 from apigateway import exceptions, extensions, schemas
 from apigateway.domains import canonicalize_email
-from apigateway.models import (
-    AccountActionToken,
-    EmailChangeRequest,
-    OAuth2Client,
-    OAuth2Token,
-    User,
-)
+from apigateway.models import AccountActionToken, OAuth2Client, OAuth2Token, User
 from apigateway.notifications import (
     ACCOUNT_ACCEPTED_MESSAGE,
     enqueue_account_request,
@@ -49,6 +44,91 @@ def _account_body():
 
 def _queue_unavailable_response():
     return {"message": "Notification service unavailable"}, 503, {"Retry-After": "60"}
+
+_REGISTRATION_EMAIL_CONSTRAINTS = frozenset(
+    {"users_email_key", "user_email_key"}
+)
+
+
+def _is_registration_email_conflict(error: IntegrityError) -> bool:
+    """Match only PostgreSQL's unique constraint for the account email."""
+    original = getattr(error, "orig", None)
+    sqlstate = getattr(original, "sqlstate", None) or getattr(
+        original, "pgcode", None
+    )
+    diagnostic = getattr(original, "diag", None)
+    return (
+        sqlstate == "23505"
+        and getattr(diagnostic, "constraint_name", None)
+        in _REGISTRATION_EMAIL_CONSTRAINTS
+    )
+
+
+def _locked_registration_user(session, canonical_email):
+    return (
+        session.query(User)
+        .filter_by(email=canonical_email)
+        .with_for_update()
+        .first()
+    )
+
+
+def _invalid_account_action_response():
+    return {"message": exceptions.AccountActionTokenError().value}, 400
+
+
+_EMAIL_ACTION_PURPOSES = ("verify_registration", "change_email")
+
+
+def _verify_email_action(session, token: str, *, for_update: bool = False):
+    """Resolve an email action without allowing one purpose to authorize another."""
+    for purpose in _EMAIL_ACTION_PURPOSES:
+        try:
+            user, action = extensions.security_service.verify_account_action_token(
+                session,
+                token,
+                purpose,
+                for_update=for_update,
+            )
+        except exceptions.AccountActionTokenError:
+            continue
+
+        try:
+            current_email = extensions.security_service.normalize_account_email(
+                str(user.email)
+            )
+        except (TypeError, ValueError):
+            raise exceptions.AccountActionTokenError()
+        if (
+            not user.active
+            or user.is_anonymous_bootstrap_user
+            or (
+                purpose == "verify_registration"
+                and (
+                    user.confirmed_at is not None
+                    or action.target_email != current_email
+                )
+            )
+            or (
+                purpose == "change_email"
+                and (
+                    user.confirmed_at is None
+                    or action.target_email == current_email
+                    or session.query(User.id)
+                    .filter(
+                        User.email == action.target_email,
+                        User.id != user.id,
+                    )
+                    .first()
+                    is not None
+                )
+            )
+        ):
+            raise exceptions.AccountActionTokenError()
+        return purpose, user, action
+    raise exceptions.AccountActionTokenError()
+
+
 
 
 
@@ -224,14 +304,9 @@ class OAuthProtectedView(Resource):
 
 
 class UserManagementView(Resource):
-    """A Resource for user registration.
-
-    This resource handles user registration requests. It checks if the user is already registered
-    and creates a new user if not"""
+    """Create an account together with its durable verification action."""
 
     decorators = [extensions.limiter_service.shared_limit("50/600 second")]
-
-    
     complete_blocklist = generate_complete_blocklist()
 
     def post(self):
@@ -255,24 +330,45 @@ class UserManagementView(Resource):
         session = extensions.db.session
         environment = request_environment(request.headers.get("Host", ""))
         try:
-            user = session.query(User).filter_by(email=canonical_email).first()
+            user = _locked_registration_user(session, canonical_email)
+            created = False
             if user is None:
-                user = extensions.security_service.create_user(
-                    email=canonical_email,
-                    password=params.password1,
-                    commit=False,
-                    given_name=params.given_name,
-                    family_name=params.family_name,
-                    registered_at=datetime.utcnow(),
-                    login_count=0,
+                try:
+                    user = extensions.security_service.create_user(
+                        email=canonical_email,
+                        password=params.password1,
+                        commit=False,
+                        given_name=params.given_name,
+                        family_name=params.family_name,
+                        registered_at=datetime.utcnow(),
+                        active=True,
+                        login_count=0,
+                    )
+                    created = True
+                except IntegrityError as error:
+                    if not _is_registration_email_conflict(error):
+                        raise
+                    session.rollback()
+                    user = _locked_registration_user(session, canonical_email)
+                    if user is None:
+                        raise
+
+            if created:
+                extensions.security_service.issue_account_action_token(
+                    session,
+                    user_id=user.id,
+                    purpose="verify_registration",
+                    target_email=canonical_email,
                 )
+                action = session.query(AccountActionToken).filter_by(
+                    user_id=user.id, purpose="verify_registration"
+                ).one()
                 outcome = enqueue_notification(
-                    "welcome_email",
-                    {"user_id": user.id, **environment},
-                    dedupe_key=f"registration:{canonical_email}",
+                    "account_action_delivery",
+                    {"action_id": action.delivery_id, **environment},
+                    dedupe_key=f"account-action-delivery:{action.delivery_id}",
                     session=session,
                     commit=False,
-                    replace=True,
                 )
             else:
                 outcome = enqueue_template_email(
@@ -298,24 +394,25 @@ class UserManagementView(Resource):
     @require_non_anonymous_bootstrap_user
     def delete(self):
         with current_app.session_scope() as session:
-            user: User = session.query(User).filter_by(fs_uniquifier=current_user.get_id()).first()
+            user = session.query(User).filter_by(
+                fs_uniquifier=current_user.get_id()
+            ).first()
             logout_user()
             session.delete(user)
             session.commit()
-
         return {"message": "success"}, 200
 
     @login_required
     @require_non_anonymous_bootstrap_user
     def put(self):
         params = schemas.update_user_request.load(_account_body())
-
         with current_app.session_scope() as session:
-            user: User = session.query(User).filter_by(fs_uniquifier=current_user.get_id()).first()
+            user = session.query(User).filter_by(
+                fs_uniquifier=current_user.get_id()
+            ).first()
             user.given_name = params.given_name or user.given_name
             user.family_name = params.family_name or user.family_name
             session.commit()
-
         return {"message": "success"}, 200
 
 
@@ -428,10 +525,6 @@ class ChangeEmailView(Resource):
 
     def post(self):
         params = schemas.change_email_request.load(_account_body())
-
-        if not current_user.validate_password(params.password):
-            return {"error": "the provided password is incorrect"}, 401
-
         try:
             canonical_email = canonicalize_email(params.email)
         except ValueError:
@@ -441,28 +534,48 @@ class ChangeEmailView(Resource):
 
         session = extensions.db.session
         try:
-            if self._is_email_registered(session, canonical_email):
-                return {"error": "{0} has already been registered".format(params.email)}, 403
+            user = (
+                session.query(User)
+                .populate_existing()
+                .filter(User.id == current_user.id)
+                .with_for_update()
+                .one_or_none()
+            )
+            if user is None:
+                session.rollback()
+                return {"message": "Unauthorized"}, 401
+            if not user.validate_password(params.password):
+                session.rollback()
+                return {"error": "the provided password is incorrect"}, 401
+            if session.query(User.id).filter(User.email == canonical_email).first():
+                session.rollback()
+                return {
+                    "error": "{0} has already been registered".format(params.email)
+                }, 403
 
-            token: str = extensions.security_service.generate_email_token()
-            self._delete_existing_email_change_requests(session)
-            action = self._create_email_change_request(session, token, canonical_email)
-            session.flush()
+            extensions.security_service.issue_account_action_token(
+                session,
+                user_id=user.id,
+                purpose="change_email",
+                target_email=canonical_email,
+            )
+            action = session.query(AccountActionToken).filter_by(
+                user_id=user.id, purpose="change_email"
+            ).one()
             environment = request_environment(request.headers.get("Host", ""))
             verification_outcome = enqueue_notification(
-                "email_change_verification",
-                {"action_id": action.id, **environment},
-                dedupe_key=f"change-email-verify:{current_user.id}",
+                "account_action_delivery",
+                {"action_id": action.delivery_id, **environment},
+                dedupe_key=f"account-action-delivery:{action.delivery_id}",
                 session=session,
                 commit=False,
-                replace=True,
             )
             notification_outcome = enqueue_template_email(
-                current_user.email,
+                str(user.email),
                 templates.EmailChangedNotification,
                 ui_env=environment["ui_env"],
                 ui_url=environment["ui_url"],
-                dedupe_key=f"change-email-notify:{current_user.id}",
+                dedupe_key=f"change-email-notify:{user.id}",
                 session=session,
                 commit=False,
                 replace=True,
@@ -480,44 +593,86 @@ class ChangeEmailView(Resource):
             current_app.logger.exception("Email change transaction failed")
             return _queue_unavailable_response()
 
-    def _delete_existing_email_change_requests(self, session):
-        session.query(EmailChangeRequest).filter(
-            EmailChangeRequest.user_id == current_user.id
-        ).delete()
-
-    def _create_email_change_request(self, session, token: str, new_email: str):
-        email_change_request = EmailChangeRequest(
-            token=token,
-            user_id=current_user.id,
-            new_email=new_email,
-        )
-        session.add(email_change_request)
-        return email_change_request
-
-    def _is_email_registered(self, session, email: str):
-        return session.query(User).filter_by(email=email).first() is not None
-
-
 
 class VerifyEmailView(Resource):
+    """Inspect or consume a body-carried registration or email-change action."""
+
     decorators = [extensions.limiter_service.shared_limit("20/600 second")]
 
-    def get(self, token):
-        user = extensions.security_service.verify_email_token(token)
+    def post(self):
+        try:
+            params = schemas.account_action_token_request.load(_account_body())
+        except ValidationError:
+            return _invalid_account_action_response()
+
         with current_app.session_scope() as session:
-            email_change_request = session.query(EmailChangeRequest).filter_by(token=token).first()
-            if email_change_request is not None:
-                extensions.security_service.change_email(
-                    email_change_request.user, email_change_request.new_email
+            try:
+                purpose, _, action = _verify_email_action(session, params.token)
+                response = {"flow": purpose, "email": action.target_email}
+                session.rollback()
+                return response, 200
+            except exceptions.AccountActionTokenError:
+                session.rollback()
+                return _invalid_account_action_response()
+
+    def put(self):
+        try:
+            params = schemas.account_action_token_request.load(_account_body())
+        except ValidationError:
+            return _invalid_account_action_response()
+
+        committed_user_id = None
+        purpose = None
+        session = extensions.db.session
+        try:
+            purpose, user, action = _verify_email_action(
+                session, params.token, for_update=True
+            )
+            if purpose == "verify_registration":
+                current_email = extensions.security_service.normalize_account_email(
+                    str(user.email)
                 )
+                if action.target_email != current_email:
+                    raise exceptions.AccountActionTokenError()
+                user.confirmed_at = datetime.utcnow()
+            else:
+                target_email = (
+                    extensions.security_service.normalize_account_email(
+                        action.target_email
+                    )
+                )
+                if (
+                    target_email
+                    == extensions.security_service.normalize_account_email(
+                        str(user.email)
+                    )
+                    or session.query(User.id)
+                    .filter(User.email == target_email, User.id != user.id)
+                    .first()
+                    is not None
+                ):
+                    raise exceptions.AccountActionTokenError()
+                user.email = target_email
 
-                session.delete(email_change_request)
-
-            session.query(User).filter_by(id=user.id).update({"confirmed_at": datetime.utcnow()})
+            committed_user_id = user.id
+            session.delete(action)
             session.commit()
-            login_user(user)
+        except (exceptions.AccountActionTokenError, IntegrityError):
+            session.rollback()
+            return _invalid_account_action_response()
+        except Exception:
+            session.rollback()
+            raise
 
-            return {"message": "success"}, 200
+        committed_user = User.query.filter_by(id=committed_user_id).one()
+        login_user(committed_user)
+        return {"message": "success", "flow": purpose}, 200
+
+
+class VerificationResendView(Resource):
+    """Accept an account-independent verification resend request."""
+
+    decorators = [extensions.limiter_service.shared_limit("20/600 second")]
 
     def put(self, email):
         try:
@@ -533,6 +688,9 @@ class VerifyEmailView(Resource):
         if outcome.state != DeliveryState.QUEUED:
             return _queue_unavailable_response()
         return {"message": ACCOUNT_ACCEPTED_MESSAGE}, 202
+
+
+
 
 
 class ChacheManagementView(Resource):

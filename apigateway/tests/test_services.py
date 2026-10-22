@@ -619,22 +619,10 @@ class TestSecurityService:
         assert app.security_service.validate_email(valid_email) is True
         assert app.security_service.validate_email(invalid_email) is False
 
-    def test_change_email(self, app):
-        email = "test@gmail.com"
-        password = "test_password"
-        user = app.security_service.create_user(email, password)
-        new_email = "new_test@gmail.com"
-        updated_user = app.security_service.change_email(user, new_email)
-        assert updated_user.email == new_email
 
-    def test_generate_email_token(self, app, mock_regular_user):
-        token = app.security_service.generate_email_token()
-        assert isinstance(token, str)
-
-    def test_verify_email_token(self, app, mock_regular_user):
-        user = app.security_service.create_user(
-            mock_regular_user.email, "test_password", id=mock_regular_user.id
-        )
-        token = app.security_service.generate_email_token()
-        user = app.security_service.verify_email_token(token)
-        assert isinstance(user, User)
+    def test_legacy_email_capability_service_is_removed(self, app):
+        assert not hasattr(app.security_service, "change_email")
+        assert not hasattr(app.security_service, "generate_email_token")
+        assert not hasattr(app.security_service, "verify_email_token")
+        assert not hasattr(app.security_service, "generate_token")
+        assert not hasattr(app.security_service, "verify_token")

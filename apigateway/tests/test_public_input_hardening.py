@@ -5,6 +5,7 @@ import pytest
 from marshmallow import ValidationError
 from flask import Flask, request
 from werkzeug.exceptions import BadRequest, RequestEntityTooLarge
+from sqlalchemy.exc import IntegrityError
 
 from apigateway import extensions, notifications, schemas, views
 from apigateway.app import register_error_handlers
@@ -116,6 +117,22 @@ def test_bounded_reader_reuses_framework_cached_request_bytes(app):
             "email": "user@example.org"
         }
 
+
+
+def test_bounded_json_reader_reuses_framework_cached_body(app):
+    payload = b'{"email":"cached@example.org"}'
+    with app.test_request_context(
+        method="POST", data=payload, content_type="application/json"
+    ):
+        assert request.get_data(cache=True) == payload
+        with mock.patch.object(
+            request.stream,
+            "read",
+            side_effect=AssertionError("cached request body was reread"),
+        ):
+            assert get_json_body(request, 100) == {
+                "email": "cached@example.org"
+            }
 
 
 @pytest.mark.parametrize(
@@ -318,14 +335,71 @@ def test_registration_creation_and_notification_are_one_transaction(app):
 
     assert response == ({"message": views.ACCOUNT_ACCEPTED_MESSAGE}, 202)
     assert existing_response == response
-    user = extensions.db.session.query(views.User).filter_by(email="user@example.org").one()
+    user = extensions.db.session.query(views.User).filter_by(
+        email="user@example.org"
+    ).one()
+    action = extensions.db.session.query(views.AccountActionToken).one()
+    assert action.user_id == user.id
+    assert action.purpose == "verify_registration"
+    assert action.target_email == "user@example.org"
     enqueue.assert_called_once()
-    assert enqueue.call_args.args[0] == "welcome_email"
-    assert enqueue.call_args.args[1]["user_id"] == user.id
+    assert enqueue.call_args.args[0] == "account_action_delivery"
+    assert enqueue.call_args.args[1]["action_id"] == action.delivery_id
     assert enqueue.call_args.kwargs["session"] is extensions.db.session
     assert enqueue.call_args.kwargs["commit"] is False
     existing_enqueue.assert_called_once()
     assert existing_enqueue.call_args.kwargs["dedupe_key"] == "registration:user@example.org"
+
+
+@pytest.mark.parametrize(
+    ("constraint_name", "expected_status", "reloads_winner"),
+    (
+        ("users_email_key", 202, True),
+        ("uq_users_fs_uniquifier", 503, False),
+    ),
+)
+def test_registration_recovers_only_typed_email_uniqueness_conflict(
+    app, constraint_name, expected_status, reloads_winner
+):
+    payload = {
+        "email": "racing-registration@example.org",
+        "password1": "Valid_password1",
+        "password2": "Valid_password1",
+        "g-recaptcha-response": "token",
+    }
+    original = RuntimeError("unique violation")
+    original.sqlstate = "23505"
+    original.diag = mock.Mock(constraint_name=constraint_name)
+    conflict = IntegrityError("INSERT INTO user", {}, original)
+    winner = object()
+    locked_results = [None, winner] if reloads_winner else [None]
+
+    with app.test_request_context(
+        "/accounts/user", method="POST", json=payload
+    ), mock.patch.object(
+        views, "verify_recaptcha", return_value=True
+    ), mock.patch.object(
+        views, "_locked_registration_user", side_effect=locked_results
+    ) as locked, mock.patch.object(
+        extensions.security_service, "create_user", side_effect=conflict
+    ), mock.patch.object(
+        views, "enqueue_notification"
+    ) as new_account_enqueue, mock.patch.object(
+        views, "enqueue_template_email", return_value=_queued()
+    ) as existing_enqueue, mock.patch.object(
+        app.logger, "exception"
+    ):
+        response = views.UserManagementView().post()
+
+    assert response[1] == expected_status
+    new_account_enqueue.assert_not_called()
+    if reloads_winner:
+        assert response == ({"message": views.ACCOUNT_ACCEPTED_MESSAGE}, 202)
+        assert locked.call_count == 2
+        existing_enqueue.assert_called_once()
+    else:
+        assert locked.call_count == 1
+        existing_enqueue.assert_not_called()
 
 
 def test_reset_and_resend_have_uniform_account_independent_responses(app):
@@ -342,7 +416,9 @@ def test_reset_and_resend_have_uniform_account_independent_responses(app):
         ):
             reset_response = views.ResetPasswordView().post()
         with app.test_request_context(method="PUT"):
-            resend_response = views.VerifyEmailView().put("USER@Example.Org.")
+            resend_response = views.VerificationResendView().put(
+                "USER@Example.Org."
+            )
 
     assert reset_response == (
         {"message": views.ACCOUNT_ACCEPTED_MESSAGE},
