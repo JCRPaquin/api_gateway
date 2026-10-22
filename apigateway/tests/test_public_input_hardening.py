@@ -106,6 +106,17 @@ def test_decoded_root_must_be_mapping(app):
         with pytest.raises(BadRequest):
             get_json_body(views.request, 100)
 
+def test_bounded_reader_reuses_framework_cached_request_bytes(app):
+    with app.test_request_context(
+        method="POST",
+        json={"email": "user@example.org"},
+    ):
+        assert views.request.get_data(cache=True)
+        assert get_json_body(views.request, 100) == {
+            "email": "user@example.org"
+        }
+
+
 
 @pytest.mark.parametrize(
     "body",

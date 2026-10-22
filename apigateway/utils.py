@@ -245,10 +245,12 @@ def get_json_body(request: Request, max_bytes: int = None) -> dict:
             raise RequestEntityTooLarge()
         return value
 
-    raw = request.stream.read(limit + 1)
+    raw = getattr(request, "_cached_data", None)
+    if raw is None:
+        raw = request.stream.read(limit + 1)
+        request._cached_data = raw
     if len(raw) > limit:
         raise RequestEntityTooLarge()
-    request._cached_data = raw
 
     value = None
     if request.is_json:
