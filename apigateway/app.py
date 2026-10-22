@@ -1,7 +1,6 @@
 from pathlib import Path
 
 from adsmutils import ADSFlask
-from authlib.integrations.flask_oauth2 import current_token
 from authlib.integrations.sqla_oauth2 import (
     create_query_client_func,
     create_save_token_func,
@@ -13,6 +12,7 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 
 from apigateway import config as gateway_config
 from apigateway import exceptions, extensions, views
+from apigateway.logging_utils import exception_log_fields
 from apigateway.models import OAuth2Client, OAuth2Token, User
 
 from opentelemetry.sdk.resources import SERVICE_NAME, Resource
@@ -182,36 +182,13 @@ def register_error_handlers(app: Flask):
 
 
 def register_verbose_exception_logging(app: Flask):
-    """Configure logging."""
+    """Configure exception logging with an allowlisted request context."""
 
     def log_exception(exc_info):
-        """
-        Override default Flask.log_exception for more verbose logging on
-        exceptions.
-        """
-        try:
-            oauth_user = current_token.user_id
-        except AttributeError:
-            oauth_user = None
-
+        exception = exc_info[1]
         app.logger.error(
-            """
-            Request:     {method} {path}
-            IP:          {ip}
-            Agent:       {agent_platform} | {agent_browser} {agent_browser_version}
-            Raw Agent:   {agent}
-            Oauth2:      {oauth_user}
-            """.format(
-                method=request.method,
-                path=request.path,
-                ip=request.remote_addr,
-                agent_platform=request.user_agent.platform,
-                agent_browser=request.user_agent.browser,
-                agent_browser_version=request.user_agent.version,
-                agent=request.user_agent.string,
-                oauth_user=oauth_user,
-            ),
-            exc_info=exc_info,
+            "Unhandled request exception method=%s route=%s exception=%s",
+            *exception_log_fields(exception),
         )
 
     app.log_exception = log_exception

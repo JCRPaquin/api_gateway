@@ -51,16 +51,16 @@ def cleanup_users(timedelta):
         ):
             current_app.db.session.delete(user)
             deletions += 1
-            current_app.logger.info("Deleted unverified user: {}".format(user.email))
 
         try:
             current_app.db.session.commit()
-        except Exception as e:
+        except Exception as exception:
             current_app.db.session.rollback()
             current_app.logger.error(
-                "Could not cleanup stale users. " "Database error; rolled back: {0}".format(e)
+                "Stale user cleanup failed exception=%s",
+                type(exception).__name__,
             )
-        current_app.logger.info("Deleted {0} stale users".format(deletions))
+        current_app.logger.info("Stale user cleanup completed count=%s", deletions)
 
 
 @cleanup.command("tokens")
@@ -103,18 +103,20 @@ def cleanup_tokens():
                 current_app.db.session.commit()
                 total += deletions
                 current_app.logger.info(
-                    "Deleted {0} expired oauth2tokens/oauth2clients".format(deletions)
+                    "Expired OAuth credential cleanup batch completed count=%s",
+                    deletions,
                 )
-            except Exception as e:
+            except Exception as exception:
                 current_app.db.session.rollback()
                 current_app.logger.error(
-                    "Could not cleanup expired oauth2tokens. "
-                    "Database error; rolled back: {0}".format(e)
+                    "Expired OAuth credential cleanup failed exception=%s",
+                    type(exception).__name__,
                 )
                 total -= deletions
 
         current_app.logger.info(
-            "Deleted total of {0} expired oauth2tokens/oauth2clients".format(total)
+            "Expired OAuth credential cleanup completed count=%s",
+            total,
         )
 
 
@@ -180,16 +182,16 @@ def cleanup_clients(timedelta, userid, ratelimit):
                 deletions += 1
         try:
             current_app.db.session.commit()
-        except Exception as e:
+        except Exception as exception:
             current_app.db.session.rollback()
             current_app.logger.error(
-                "Could not cleanup expired oauth2clients. "
-                "Database error; rolled back: {0}".format(e)
+                "Expired OAuth client cleanup failed exception=%s",
+                type(exception).__name__,
             )
             return
         current_app.logger.info(
-            "Deleted {0} oauth2clients whose last_activity was "
-            "at least {1} old and userid={2}".format(deletions, timedelta, userid)
+            "Expired OAuth client cleanup completed count=%s",
+            deletions,
         )
 
 

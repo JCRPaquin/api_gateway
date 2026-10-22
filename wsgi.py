@@ -4,9 +4,14 @@ from opentelemetry.instrumentation.flask import FlaskInstrumentor
 from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
 
 from apigateway.app import create_app
+from apigateway.logging_utils import sanitize_request_span, sanitize_response_span
 
 _gateway = create_app()
-FlaskInstrumentor.instrument_app(_gateway)
+FlaskInstrumentor.instrument_app(
+    _gateway,
+    request_hook=sanitize_request_span,
+    response_hook=sanitize_response_span,
+)
 
 with _gateway.app_context():
     SQLAlchemyInstrumentor().instrument(engine=_gateway.db.engine)

@@ -175,7 +175,7 @@ alembic downgrade <revision>
 alembic revision --autogenerate -m "revision description"
 ```
 
-#### Migration rollback compatibility
+### Migration rollback compatibility
 
 The `8e0d08daa203` OAuth schema migration validates data before replacing either
 schema. Upgrade is blocked when legacy tokens have missing access tokens,
@@ -208,3 +208,25 @@ either rename that reviewed row to `anonymous@ads` before downgrade (after
 resolving any collision), or leave it for reviewed manual deletion after
 downgrade. The migration intentionally does not guess from current
 configuration.
+
+## Log and telemetry data contract
+
+Application request logs are allowlisted to fixed outcome text plus the HTTP
+method, the matched Flask route template, and (for failures) the exception
+class. Unmatched requests use the literal route `<unmatched>`. Logs must not
+contain concrete paths or query strings, request or response bodies, account
+tokens, email addresses, cookies, authorization values, user-agent strings,
+client IP addresses, or exception messages.
+
+Exported HTTP spans follow the same boundary. Span names use
+`METHOD <route-template>`; method, status, and route template remain available,
+while URL, query, identity, and captured-header attributes are replaced before
+export. Ingress proxies and WSGI access loggers operate outside this policy and
+must also be configured not to record raw request targets, query strings, or
+headers.
+
+Alembic resolves the configured database URI without printing it. Operators
+must rotate deployed database and API credentials that may have appeared in
+historical startup, application, ingress, or CI logs. Restrict access to those
+logs and expire retained copies according to the incident-response and
+retention policies after rotation.

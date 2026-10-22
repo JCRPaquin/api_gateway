@@ -18,6 +18,7 @@ from werkzeug.security import gen_salt
 
 from apigateway import email_templates as templates
 from apigateway import exceptions, extensions, schemas
+from apigateway.logging_utils import exception_log_fields, request_log_fields
 from apigateway.models import (
     EmailChangeRequest,
     OAuth2Client,
@@ -129,15 +130,13 @@ class UserAuthView(Resource):
             try:
                 schemas.PasswordValidator()(params.password)
             except:  # noqa
-                current_app.logger.info(
-                    "Forcing generation of password reset token for user: {}".format(user.id)
-                )
+                current_app.logger.info("Forcing password reset token generation")
                 token: str = extensions.security_service.generate_password_token(user.id)
                 self._delete_existing_password_change_requests(session, user.id)
                 self._create_password_change_request(session, token, user.id)
                 send_password_reset_email(token, user.email)
 
-                current_app.logger.info("Forcing password reset for user {}".format(user.email))
+                current_app.logger.info("Forcing password reset")
 
                 abort(
                     422,
@@ -221,16 +220,16 @@ class UserManagementView(Resource):
         user = User.query.filter_by(email=params.email).first()
         if user is not None:
             send_account_registration_attempt_email(params.email)
-            current_app.logger.warning(
-                "Registration attempt for existing user {0}".format(params.email)
-            )
+            current_app.logger.warning("Registration attempted for existing account")
             return {"message": "success"}, 200
 
         try:
             if current_app.config.get("BLOCK_DISPOSABLE_EMAIL_DOMAINS", False):
                 email_domain = normalize_email_domain(params.email.rsplit("@", 1)[1])
                 if email_domain in self.complete_blocklist:
-                    current_app.logger.warning("User {} attempting to register with disposable email domain.".format(params.email))
+                    current_app.logger.warning(
+                        "Registration rejected outcome=disposable_email_domain"
+                    )
                     raise ValueError("Invalid email domain: {}. Account registration with disposable email services is not allowed.".format(email_domain))
 
             user: User = extensions.security_service.create_user(
@@ -244,7 +243,7 @@ class UserManagementView(Resource):
 
             token = extensions.security_service.generate_email_token(user.id)
             send_welcome_email(token, user.email)
-            current_app.logger.info("Sent Welcome email for user: {}".format(user.email))
+            current_app.logger.info("Welcome email dispatched")
             return {"message": "success"}, 200
         except ValueError as e:
             return {"error": str(e)}, 400
@@ -320,9 +319,7 @@ class ResetPasswordView(Resource):
                 self._delete_existing_password_change_requests(session, user.id)
                 self._create_password_change_request(session, token, user.id)
 
-                current_app.logger.info(
-                    "Sent password reset email for user: {}".format(token_or_email)
-                )
+                current_app.logger.info("Password reset email dispatched")
                 send_password_reset_email(token, token_or_email)
 
             return {"message": "success"}, 200
@@ -693,7 +690,8 @@ class UserFeedbackView(Resource):
     def post(self):
         params = get_json_body(request)
         current_app.logger.info(
-            "Received feedback of type {0}: {1}".format(params.get("_subject"), params)
+            "Feedback received method=%s route=%s",
+            *request_log_fields(),
         )
 
         if not self._verify_captcha(params):
@@ -713,9 +711,8 @@ class UserFeedbackView(Resource):
 
         if not self._send_email(params, submitter_email, subject, email_body, attachments):
             current_app.logger.error(
-                "Sending of email failed. Feedback data submitted by {0}: {1}".format(
-                    submitter_email, params
-                )
+                "Feedback email failed method=%s route=%s",
+                *request_log_fields(),
             )
 
         slack_data = self._prepare_slack_data(params, subject, email_body)
@@ -746,8 +743,11 @@ class UserFeedbackView(Resource):
                 attachments,
             )
             return True
-        except Exception as e:  # noqa
-            current_app.logger.error("Failed to send feedback email from user: {} with error {}".format(submitter_email, e))
+        except Exception as exception:  # noqa
+            current_app.logger.error(
+                "Feedback email failed method=%s route=%s exception=%s",
+                *exception_log_fields(exception),
+            )
             return False
 
     def _post_to_slack(self, slack_data):
@@ -757,14 +757,18 @@ class UserFeedbackView(Resource):
                 data=json.dumps(slack_data),
                 timeout=60,
             )
-        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as ex:
-            current_app.logger.error("Failed to post to slack", ex)
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exception:
+            current_app.logger.error(
+                "Feedback Slack request failed method=%s route=%s exception=%s",
+                *exception_log_fields(exception),
+            )
             abort(504)
 
-        current_app.logger.info("Slack response: {0}".format(slack_response.status_code))
-
-        # Slack annoyingly redirects if you have the wrong end point
-        current_app.logger.info("Slack API" in slack_response.text)
+        current_app.logger.info(
+            "Feedback Slack request completed status=%s method=%s route=%s",
+            slack_response.status_code,
+            *request_log_fields(),
+        )
 
         return slack_response
 
@@ -788,8 +792,11 @@ class UserFeedbackView(Resource):
             else:
                 return None, None, None
 
-        except Exception as e:
-            current_app.logger.error("Error while processing feedback form data: {0}".format(e))
+        except Exception as exception:
+            current_app.logger.error(
+                "Feedback preparation failed method=%s route=%s exception=%s",
+                *exception_log_fields(exception),
+            )
             return None, None, None
 
         return email_body, attachments, submitter_email
@@ -905,11 +912,7 @@ class PersonalTokenView(Resource):
         ).first()
 
         if not token:
-            current_app.logger.error(
-                "No token found for ADS API Client with id {0}. This should not happen!".format(
-                    client.id
-                )
-            )
+            current_app.logger.error("Personal token lookup failed outcome=missing_token")
             return {"message": "No token found for ADS API client"}, 500
 
         response = {
@@ -979,9 +982,7 @@ class PersonalTokenView(Resource):
 
                 if not token:
                     current_app.logger.error(
-                        "No token found for ADS API Client with id {0}. This should not happen!".format(
-                            client.id
-                        )
+                        "Personal token lookup failed outcome=missing_token"
                     )
                     return {"message": "No token found for the ADS API client"}, 500
 

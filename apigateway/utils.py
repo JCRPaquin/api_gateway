@@ -26,6 +26,7 @@ from apigateway.email_templates import (
     WelcomeVerificationEmail,
 )
 from apigateway.exceptions import Oauth2HttpError
+from apigateway.logging_utils import exception_log_fields, request_log_fields
 
 
 def get_request_site():
@@ -79,7 +80,10 @@ def send_email(
     ui_url: str = "https://ui.adsabs.harvard.edu",
 ):
     if current_app.config["MAIL_TEST_BYPASS"]:
-        current_app.logger.warning("Email delivery bypassed by explicit test configuration")
+        current_app.logger.warning(
+            "Email delivery suppressed outcome=testing method=%s route=%s",
+            *request_log_fields(),
+        )
         return
 
     if not mail_server:
@@ -109,7 +113,8 @@ def send_feedback_email(
 ):
     if current_app.config["MAIL_TEST_BYPASS"]:
         current_app.logger.warning(
-            "Feedback email delivery bypassed by explicit test configuration"
+            "Feedback email delivery suppressed method=%s route=%s",
+            *request_log_fields(),
         )
         return
 
@@ -138,8 +143,11 @@ def send_feedback_email(
     with smtplib.SMTP(mail_server) as s:
         try:
             s.send_message(message)
-        except Exception:
-            current_app.logger.exception("Failed to send message for Feedback email from: {}".format(submitter_email))
+        except Exception as exception:
+            current_app.logger.error(
+                "Feedback email delivery failed method=%s route=%s exception=%s",
+                *exception_log_fields(exception),
+            )
 
 
 def verify_recaptcha(request: Request, endpoint: str = None):
@@ -156,7 +164,8 @@ def verify_recaptcha(request: Request, endpoint: str = None):
     """
     if current_app.config["RECAPTCHA_TEST_BYPASS"]:
         current_app.logger.warning(
-            "reCAPTCHA verification bypassed by explicit test configuration"
+            "reCAPTCHA verification suppressed method=%s route=%s",
+            *request_log_fields(),
         )
         return True
 
@@ -248,7 +257,8 @@ class ProxyView(View):
             http_method_func = getattr(self._session, request.method.lower())
 
             current_app.logger.info(
-                "Proxying %s request to %s", request.method.upper(), remote_url
+                "Proxy request started method=%s route=%s",
+                *request_log_fields(),
             )
 
             response: requests.Response = http_method_func(
@@ -256,9 +266,10 @@ class ProxyView(View):
             )
 
             return response.content, response.status_code, dict(response.headers)
-        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exception:
             current_app.logger.info(
-                "Gateway Timeout with %s request to %s", request.method.upper(), remote_url
+                "Proxy request failed outcome=gateway_timeout method=%s route=%s exception=%s",
+                *exception_log_fields(exception),
             )
             return b"504 Gateway Timeout", 504
 
@@ -281,8 +292,11 @@ class ProxyView(View):
                 resolver_groups = resolver_check.groups()
                 return str(self._remote_base_url) + "/" + os.path.normpath(resolver_groups[0]) \
                     + resolver_groups[1] + os.path.normpath(resolver_groups[2])
-        except ValueError:
-            current_app.logger.exception("Failed to properly check url path for resolver verify_url path.")    
+        except ValueError as exception:
+            current_app.logger.error(
+                "Proxy URL construction failed method=%s route=%s exception=%s",
+                *exception_log_fields(exception),
+            )
         return urljoin(self._remote_base_url, path)
 
 

@@ -34,6 +34,7 @@ from werkzeug.security import gen_salt
 
 from apigateway import extensions
 from apigateway.exceptions import NoClientError, NotFoundError, ValidationError
+from apigateway.logging_utils import exception_log_fields
 from apigateway.models import AnonymousUser, OAuth2Client, OAuth2Token, Role, User
 from apigateway.utils import GatewayResourceProtector, ProxyView
 
@@ -236,7 +237,7 @@ class AuthService(GatewayService):
             token = self._create_user_token(client, expires=expires)
             extensions.db.session.add(token)
 
-            self._logger.info("Created BB client for {email}".format(email=current_user.email))
+            self._logger.info("Created OAuth client")
         else:
             token = OAuth2Token.query.filter_by(
                 client_id=client.id,
@@ -247,7 +248,7 @@ class AuthService(GatewayService):
                 token = self._create_user_token(client, expires=expires)
 
                 extensions.db.session.add(token)
-                self._logger.info("Created BB client for {email}".format(email=current_user.email))
+                self._logger.info("Created OAuth client")
 
             client.last_activity = datetime.now()
             extensions.db.session.add(client)
@@ -435,17 +436,19 @@ class ProxyService(GatewayService):
             deploy_path (str): The deployment path of the service
             csrf_exempt (bool, optional): Whether to exempt the services from CSRF protection. Defaults to True.
         """
-        self._logger.info("Registering service %s at %s", base_url, deploy_path)
+        self._logger.info("Registering proxy service")
 
         try:
             resource_json = self._fetch_resource_document(base_url)
-        except requests.exceptions.RequestException as ex:
-            self._logger.error("Could not fetch resource document for %s: %s", base_url, ex)
+        except requests.exceptions.RequestException as exception:
+            self._logger.error(
+                "Proxy service discovery failed exception=%s",
+                type(exception).__name__,
+            )
             return
 
-        self._logger.info("Discovered %s endpoints:", deploy_path)
+        self._logger.info("Discovered proxy service endpoints count=%s", len(resource_json))
         for remote_path, properties in resource_json.items():
-            self._logger.info("- %s", remote_path)
 
             properties.setdefault(
                 "rate_limit",
@@ -522,7 +525,7 @@ class ProxyService(GatewayService):
             return response.json()
         except requests.exceptions.RequestException as ex:
             if extensions.storage_service.has(resource_url):
-                self._logger.info("Using cached resource document for %s", resource_url)
+                self._logger.info("Using cached proxy resource document")
                 return extensions.storage_service.get(resource_url)
             else:
                 raise ex
@@ -671,7 +674,7 @@ class LimiterService(GatewayService, Limiter):
             all_limits = list(defaults) + list(decorated)
             for limit in all_limits:
                 key = limit.limit.key_for(request_endpoint, scope)
-                self._logger.info("Clearing limit for key %s", key)
+                self._logger.info("Clearing rate limit entry")
                 self.storage.clear(key)
 
             extensions.storage_service.delete(
@@ -962,8 +965,11 @@ class StorageService(GatewayService):
                 self._redis_down = True
                 self._logger.warning("Redis is down, falling back to local storage")
                 return func(self, *args, **kwargs)
-            except Exception as ex:
-                self._logger.error("Failed to handle Redis exception", ex)
+            except Exception as exception:
+                self._logger.error(
+                    "Redis operation failed exception=%s",
+                    type(exception).__name__,
+                )
                 raise
 
         return wrapper
@@ -1063,7 +1069,7 @@ class CacheService(GatewayService, Cache):
 
         params_tuple = list(parameters.items()) if parameters else []
         key = self._make_cache_key(request_path, params_tuple)
-        self._logger.info("Clearing cache for key %s", key)
+        self._logger.info("Clearing cache entry")
         return self.delete(key)
 
     def cached(
@@ -1326,7 +1332,7 @@ class SecurityService(GatewayService, Security):
 
         if user_id is None:
             user_id = current_user.id
-        current_app.logger.info("Generating password token for user: {}".format(user_id))
+        current_app.logger.info("Generating password token")
 
         return self.generate_token(user_id, salt=self.get_service_config("VERIFY_PASSWORD_SALT"))
 
@@ -1382,12 +1388,13 @@ class SecurityService(GatewayService, Security):
         """
         try:
             user_id = self._token_serializer.loads(token, max_age=86400, salt=salt)
-        except Exception as ex:
+        except Exception as exception:
             self._logger.warning(
-                "{0} verification token not validated. Reason: {1}".format(token, ex)
+                "Verification token rejected method=%s route=%s exception=%s",
+                *exception_log_fields(exception),
             )
             raise ValueError("unknown verification token")
-        current_app.logger.info("Verifying token for user: {}".format(user_id))
+        current_app.logger.info("Verification token accepted")
         user: User = User.query.filter_by(id=user_id).first()
 
         if user is None:
@@ -1415,8 +1422,11 @@ class KafkaProducerService(GatewayService):
                 request_timeout_ms=self.get_service_config("REQUEST_TIMEOUT_MS", 500),
                 acks=0,  # Fire and forget. We don't want issues with the broker to affect the Gateway.
             )
-        except Exception as ex:
-            self._logger.error("Could not connect to Kafka: %s", ex)
+        except Exception as exception:
+            self._logger.error(
+                "Kafka connection failed exception=%s",
+                type(exception).__name__,
+            )
             return None
 
     def _register_hooks(self, app: Flask):
@@ -1425,8 +1435,11 @@ class KafkaProducerService(GatewayService):
             if self._producer is not None:
                 try:
                     real_user = current_user._get_current_object()
-                except RuntimeError:
-                    current_app.logger.exception("Unable to collect real user. Most likely due to unbound session.")
+                except RuntimeError as exception:
+                    current_app.logger.error(
+                        "Kafka user collection failed exception=%s",
+                        type(exception).__name__,
+                    )
                     return response
                 self._producer.send(
                     self.get_service_config("REQUEST_TOPIC"),

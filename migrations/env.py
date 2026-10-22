@@ -6,6 +6,7 @@ from alembic import context
 from sqlalchemy import engine_from_config, pool
 
 from apigateway.models import base_model
+from apigateway.migration_utils import get_app_config
 
 project_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(project_dir)
@@ -54,20 +55,6 @@ def run_migrations_offline() -> None:
 
     with context.begin_transaction():
         context.run_migrations()
-
-
-def get_app_config(key):
-    opath = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    if opath not in sys.path:
-        sys.path.insert(0, opath)
-
-    from apigateway import app as application
-
-    app = application.create_app()
-
-    with app.app_context() as c:
-        print("Getting actual config for", key, app.config.get(key))
-        return app.config.get(key)
 
 
 def run_migrations_online() -> None:
