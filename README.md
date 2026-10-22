@@ -174,3 +174,37 @@ alembic upgrade <revision>
 alembic downgrade <revision>
 alembic revision --autogenerate -m "revision description"
 ```
+
+#### Migration rollback compatibility
+
+The `8e0d08daa203` OAuth schema migration validates data before replacing either
+schema. Upgrade is blocked when legacy tokens have missing access tokens,
+expiration timestamps, or client relationships. Downgrade is blocked when
+current clients cannot satisfy the legacy required fields, metadata format, and
+unique client ID constraints; when relationships cannot be mapped; or when
+non-null refresh tokens are duplicated. Copy counts, relationships, and token
+expiration are checked again before source tables are dropped. A failure rolls
+back the Alembic transaction and reports only counts and a bounded sample of
+database row IDs, never credential values.
+
+Before rolling back across this revision, take a database backup and first
+downgrade from the current head so the later index revisions are removed in
+order. If validation fails:
+
+1. Use the reported row IDs to review the affected rows without copying
+   credentials into tickets or logs.
+2. Repair the missing required values, invalid client metadata, duplicate
+   client/refresh identifiers, or orphaned relationship in the still-current
+   schema. Explicitly delete a row only under the deployment's data-retention
+   procedure; the migration will not discard or invent credential data.
+3. Rerun the same Alembic command. Do not manually drop the source tables.
+
+The historical `26889be04d70` seed now has the migration-owned identity
+`anonymous@ads`; rollback no longer reads the application's current bootstrap
+configuration. Installations that originally applied that revision with a
+custom bootstrap email have no stored ownership marker. Before crossing the
+revision in reverse, identify the original seed from deployment records and
+either rename that reviewed row to `anonymous@ads` before downgrade (after
+resolving any collision), or leave it for reviewed manual deletion after
+downgrade. The migration intentionally does not guess from current
+configuration.

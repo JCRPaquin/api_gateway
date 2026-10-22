@@ -23,6 +23,8 @@ revision = "26889be04d70"
 
 down_revision = "51f3b3b5cd5d"
 
+SEED_EMAIL = "anonymous@ads"
+
 
 users = table(
     "users",
@@ -48,24 +50,16 @@ permissions = table(
 )
 
 
-def get_email():
-    from apigateway.app import create_app
-
-    app = create_app()
-    email = app.config.get("ANONYMOUS_BOOTSTRAP_USER_EMAIL", "anon@ads")
-    return email
-
-
 def upgrade():
-    email = get_email()
+    timestamp = datetime.datetime.now()
     op.bulk_insert(
         users,
         [
             {
-                "email": email,
+                "email": SEED_EMAIL,
                 "active": True,
-                "confirmed_at": datetime.datetime.now(),
-                "registered_at": datetime.datetime.now(),
+                "confirmed_at": timestamp,
+                "registered_at": timestamp,
             },
         ],
         multiinsert=False,
@@ -73,5 +67,4 @@ def upgrade():
 
 
 def downgrade():
-    email = get_email()
-    op.execute(users.delete().where(users.c.email == op.inline_literal(email)))
+    op.execute(users.delete().where(users.c.email == op.inline_literal(SEED_EMAIL)))
