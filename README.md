@@ -197,13 +197,13 @@ trimmed, trailing-dot-free lowercase IDNA ASCII.
 
 Registration account creation and its welcome-email outbox row are committed
 atomically. Password reset is deliberately two-stage: the worker first claims
-the account-independent request, replaces the user's prior reset action, and
-commits a requeued delivery event containing only that action's random stable
-delivery ID. A later claim locks and reloads that committed action before
-deriving a short-lived signed bearer in memory. Reset action rows contain no
-bearer, digest, or URL, and active or terminal outbox JSON never contains the
-bearer or bearer URL. The hardening migration invalidates legacy reset actions
-whose raw bearer was stored in the database.
+the account-independent request, replaces the user's prior account-action
+token, and commits a requeued delivery event containing only that action's
+random stable delivery ID. A later claim locks and reloads that exact committed
+action before deriving its signed bearer in memory. Account-action rows contain
+only the bearer digest, state binding, expiry, and delivery identity; active or
+terminal outbox JSON never contains the bearer or bearer URL. The account-action
+migration invalidates and removes all legacy reset actions.
 
 Apply the `notification_outbox` migration and run one or more workers:
 
@@ -223,6 +223,10 @@ leaves its delivery event claimable; no SMTP call has occurred. Delivery is
 before the terminal-state commit may send the same still-current committed
 action again after lease recovery. It can never send an action superseded in
 the meantime.
+Forced resets triggered when a user logs in with a password that no longer
+meets policy use the same account-action row and durable delivery event. Their
+action replacement and outbox enqueue share the login transaction; reset mail
+is never sent directly by a request handler.
 
 Password-reset generation, delivery, and redemption use the same
 `User`-then-action lock order. The password mutation and deletion of the exact
@@ -257,3 +261,45 @@ are isolated by the effective limiter identity and scope, expire after
 clamp accounted work with `LIMITER_SERVICE_MAX_ACCOUNTED_SECONDS`. Total request
 cost is capped by `LIMITER_SERVICE_MAX_COST`. Explicit `cost=` callbacks opt out
 of adaptive charging.
+## Account-action tokens and password recovery
+
+Password recovery uses a one-time, purpose-bound account-action capability.
+Only a SHA-256 digest of the signed token is stored. The token is also bound
+with a keyed state digest to the current password hash, normalized email,
+active flag, and confirmation state. A later account-state change invalidates
+the pending reset. The default lifetime is 24 hours and can be changed with
+`SECURITY_SERVICE_ACCOUNT_ACTION_TOKEN_EXPIRES` (seconds). Reset email copy
+does not hard-code that default.
+
+The password-recovery API accepts credentials only in JSON request bodies:
+
+- `POST /accounts/user/reset-password` accepts `email` and
+  `g-recaptcha-response`. Its success response is identical when an account is
+  missing, unverified, or the anonymous bootstrap account.
+- `POST /accounts/user/reset-password/verify` accepts `token` and performs a
+  read-only validity check.
+- `PUT /accounts/user/reset-password` accepts `token`, `password1`, and
+  `password2`, then consumes the token.
+
+Reset links put the bearer token in the UI URL fragment. The fragment is not
+sent in an HTTP request target; the UI submits it to the gateway in a
+CSRF-protected JSON request.
+
+The former credential-bearing reset paths are removed. Deploying revision
+`b8f2a6d41c73` drops the legacy `password_change_request` table, so all reset
+links issued before the deployment are intentionally invalidated and users
+must request new links. Downgrading recreates that table empty; it does not
+restore old links.
+
+Reset consumption locks the target user before its action row and commits the
+OAuth token/client revocation, password hash, session-identifier rotation, and
+account-action deletion together. A failed transaction preserves all five
+pieces of prior state. On success, old browser sessions and bearer tokens are
+both invalid.
+SQLite tests cover transaction outcomes but do not prove row-lock
+serialization. Concurrent-consumer verification must run against PostgreSQL
+with two independent sessions.
+
+Responses from reset, login, change-password, change-email, verification,
+CSRF, bootstrap, and personal-token endpoints carry `Cache-Control: no-store`
+and `Pragma: no-cache`, including error responses.

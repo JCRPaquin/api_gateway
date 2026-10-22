@@ -31,6 +31,7 @@ def app(request):
             "SECURITY_SERVICE_VERIFY_EMAIL_SALT": (
                 "email-test-purpose-salt-32-bytes-minimum"
             ),
+            "SECURITY_SERVICE_ACCOUNT_ACTION_TOKEN_EXPIRES": 24 * 60 * 60,
             "GOOGLE_RECAPTCHA_PRIVATE_KEY": "explicit-test-recaptcha-key",
             "RECAPTCHA_TEST_BYPASS": True,
             "MAIL_TEST_BYPASS": True,
@@ -46,6 +47,9 @@ def app(request):
             "HTTPS_ENFORCEMENT": False,
             "TRUSTED_PROXY_HOPS": 0,
             "SECURITY_EMAIL_VALIDATOR_ARGS": {"check_deliverability": False},
+            "SESSION_COOKIE_SECURE": False,
+            "SESSION_COOKIE_HTTPONLY": True,
+            "SESSION_COOKIE_SAMESITE": "Lax",
         },
         allow_insecure_test_config=True,
         name=request.node.name,

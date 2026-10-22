@@ -1,11 +1,12 @@
 from datetime import datetime, timedelta
 from unittest import mock
+from urllib.parse import urlsplit
 
 import pytest
 
 from apigateway import notifications
 from apigateway.email_templates import AccountRegistrationAttemptEmail
-from apigateway.models import NotificationOutbox, PasswordChangeRequest, User
+from apigateway.models import AccountActionToken, NotificationOutbox, User
 from apigateway.utils import DeliveryResult, DeliveryState
 
 
@@ -159,7 +160,7 @@ def test_password_reset_commits_action_before_smtp_and_recovers_after_acceptance
                 notifications._prepare_password_reset(*claim)
         send.assert_not_called()
 
-        action = app.db.session.query(PasswordChangeRequest).one()
+        action = app.db.session.query(AccountActionToken).one()
         assert not hasattr(action, "token")
         job = app.db.session.query(NotificationOutbox).one()
         assert job.event_type == "password_reset_action"
@@ -181,11 +182,12 @@ def test_password_reset_commits_action_before_smtp_and_recovers_after_acceptance
         ) as send:
             assert notifications._deliver(claimed) == accepted
         accepted_url = send.call_args.kwargs["verification_url"]
-        assert (
-            app.security_service.verify_password_action(accepted_url.rsplit("/", 1)[1])
-            .delivery_id
-            == action.delivery_id
+        token = urlsplit(accepted_url).fragment.rsplit("/", 1)[1]
+        verified_user, verified_action = app.security_service.verify_account_action_token(
+            app.db.session, token, "password_reset"
         )
+        assert verified_user.id == user.id
+        assert verified_action.delivery_id == action.delivery_id
         app.db.session.rollback()
 
         claimed = app.db.session.query(NotificationOutbox).filter_by(id=job_id).one()
@@ -227,7 +229,7 @@ def test_superseded_password_reset_delivery_is_suppressed(app):
             "password_reset_request", user.email, "localhost"
         )
         notifications.process_outbox_batch()
-        current_action = app.db.session.query(PasswordChangeRequest).one()
+        current_action = app.db.session.query(AccountActionToken).one()
         assert current_action.delivery_id != first_action_id
 
         first_job = app.db.session.query(NotificationOutbox).filter_by(
@@ -254,7 +256,7 @@ def test_consumed_password_reset_delivery_is_suppressed(app):
     request_claim = notifications.claim_notification()
     assert notifications._prepare_password_reset(*request_claim) is None
     job = app.db.session.query(NotificationOutbox).one()
-    action = app.db.session.query(PasswordChangeRequest).one()
+    action = app.db.session.query(AccountActionToken).one()
     app.db.session.delete(action)
     app.db.session.commit()
 
@@ -294,7 +296,7 @@ def test_password_reset_stage_quota_failure_rolls_back_action(app):
     finally:
         app.config["MAIL_OUTBOX_MAX_ACTIVE_PAYLOAD_BYTES"] = original_limit
 
-    assert app.db.session.query(PasswordChangeRequest).count() == 0
+    assert app.db.session.query(AccountActionToken).count() == 0
     job = app.db.session.query(NotificationOutbox).one()
     assert job.event_type == "password_reset_request"
     assert job.state == "retry"

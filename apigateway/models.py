@@ -108,7 +108,9 @@ class OAuth2Client(base_model, OAuth2ClientMixin):
 
     id = sa.Column(sa.Integer, primary_key=True, autoincrement=True)
     user_id = sa.Column(
-        sa.String, sa.ForeignKey("user.fs_uniquifier", ondelete="CASCADE"), index=True
+        sa.String,
+        sa.ForeignKey("user.fs_uniquifier", ondelete="CASCADE"),
+        index=True,
     )
     ratelimit_multiplier = sa.Column(sa.Float, default=1.0)
     individual_ratelimit_multipliers = sa.Column(sa.JSON)
@@ -132,7 +134,9 @@ class OAuth2Token(base_model, OAuth2TokenMixin):
 
     id = sa.Column(sa.Integer, primary_key=True, autoincrement=True)
     user_id = sa.Column(
-        sa.String, sa.ForeignKey("user.fs_uniquifier", ondelete="CASCADE"), index=True
+        sa.String,
+        sa.ForeignKey("user.fs_uniquifier", ondelete="CASCADE"),
+        index=True,
     )
     user = relationship("User")
     client_id = sa.Column(
@@ -160,14 +164,33 @@ class EmailChangeRequest(base_model):
     new_email = sa.Column(sa.Text)
 
 
-class PasswordChangeRequest(base_model):
-    __tablename__ = "password_change_request"
+class AccountActionToken(base_model):
+    __tablename__ = "account_action_token"
+    __table_args__ = (
+        sa.CheckConstraint(
+            "purpose IN ('password_reset', 'verify_registration', 'change_email')",
+            name="ck_account_action_token_purpose",
+        ),
+        sa.UniqueConstraint(
+            "user_id", "purpose", name="uq_account_action_token_user_purpose"
+        ),
+    )
 
     id = sa.Column(sa.Integer, primary_key=True, autoincrement=True)
     delivery_id = sa.Column(
         sa.String(36), unique=True, nullable=False, default=lambda: str(uuid.uuid4())
     )
-    user_id = sa.Column(sa.Integer(), sa.ForeignKey("user.id", ondelete="CASCADE"))
+    token_digest = sa.Column(sa.String(64), nullable=False, unique=True, index=True)
+    user_id = sa.Column(
+        sa.Integer,
+        sa.ForeignKey("user.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    purpose = sa.Column(sa.String(32), nullable=False)
+    target_email = sa.Column(sa.String(255), nullable=True)
+    state_digest = sa.Column(sa.String(64), nullable=False)
+    issued_at = sa.Column(sa.DateTime(timezone=True), nullable=False)
+    expires_at = sa.Column(sa.DateTime(timezone=True), nullable=False)
     user = relationship("User")
 
 

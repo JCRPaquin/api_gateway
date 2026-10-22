@@ -149,7 +149,21 @@ class ChangeEmailRequestSchema:
 
 
 @dataclass
+class ResetPasswordInitiateRequestSchema:
+    email: str = field(metadata={"validate": PublicEmailValidator()})
+    g_recaptcha_response: str = field(
+        default=None, metadata={"data_key": "g-recaptcha-response"}
+    )
+
+
+@dataclass
+class AccountActionTokenRequestSchema:
+    token: str = field()
+
+
+@dataclass
 class ResetPasswordRequestSchema:
+    token: str = field()
     password1: str = field(metadata={"validate": PasswordValidator()})
     password2: str = field(metadata={"validate": PasswordValidator()})
 
@@ -399,6 +413,12 @@ change_password_request = marshmallow_dataclass.class_schema(ChangePasswordReque
 update_user_request = marshmallow_dataclass.class_schema(UpdateUserRequestSchema)()
 change_email_request = marshmallow_dataclass.class_schema(ChangeEmailRequestSchema)()
 captcha_request = marshmallow_dataclass.class_schema(CaptchaRequestSchema)()
+reset_password_initiate_request = marshmallow_dataclass.class_schema(
+    ResetPasswordInitiateRequestSchema
+)()
+account_action_token_request = marshmallow_dataclass.class_schema(
+    AccountActionTokenRequestSchema
+)()
 reset_password_request = marshmallow_dataclass.class_schema(ResetPasswordRequestSchema)()
 clear_cache_request = marshmallow_dataclass.class_schema(ClearCacheRequestSchema)()
 clear_limit_request = marshmallow_dataclass.class_schema(ClearLimitRequestSchema)()

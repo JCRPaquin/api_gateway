@@ -450,6 +450,7 @@ def make_json_diff(original: str, updated: str):
 
 
 
+
 def generate_complete_blocklist():
     with open(
         os.path.abspath(os.path.join(os.path.dirname(__file__), "disallowed_email_domain_list.conf"))

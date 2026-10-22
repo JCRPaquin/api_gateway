@@ -116,11 +116,13 @@ CORS_HEADERS = [
     "X-BB-Api-Client-Version",
     "Authorization",
     "Accept",
+    "X-CSRFToken",
+    "X-CSRF-Token",
 ]
 
 CORS_DOMAINS = _environment_list("CORS_DOMAINS")
 
-CORS_METHODS = ["GET", "OPTIONS", "POST"]
+CORS_METHODS = ["GET", "OPTIONS", "POST", "PUT"]
 
 
 # Logging
@@ -207,6 +209,10 @@ SECURITY_SERVICE_VERIFY_EMAIL_SALT = environ.get(
 SECURITY_SERVICE_VERIFY_EMAIL_SALT_FILE = environ.get(
     "SECURITY_SERVICE_VERIFY_EMAIL_SALT_FILE"
 )
+SECURITY_SERVICE_ACCOUNT_ACTION_TOKEN_EXPIRES = _environment_int(
+    "SECURITY_SERVICE_ACCOUNT_ACTION_TOKEN_EXPIRES", 24 * 60 * 60
+)
+
 
 BOOTSTRAP_SCOPES = []
 USER_DEFAULT_SCOPES = ["user", "api"]
@@ -510,6 +516,10 @@ def validate_runtime_config(config, allow_insecure_test_config=False):
     mail_bypass = _validate_boolean(config, "MAIL_TEST_BYPASS", invalid)
     if mail_bypass and not insecure_test_mode:
         invalid.append("MAIL_TEST_BYPASS")
+
+    account_action_expiry = config.get("SECURITY_SERVICE_ACCOUNT_ACTION_TOKEN_EXPIRES")
+    if type(account_action_expiry) is not int or account_action_expiry <= 0:
+        invalid.append("SECURITY_SERVICE_ACCOUNT_ACTION_TOKEN_EXPIRES")
 
     _validate_authorities(config, invalid)
     _validate_origins(config.get("CORS_DOMAINS"), invalid)

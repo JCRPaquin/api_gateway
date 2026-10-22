@@ -2,6 +2,7 @@ import base64
 import json
 import uuid
 from datetime import datetime, timedelta
+from urllib.parse import urlsplit, urlunsplit
 
 import requests
 import sqlalchemy as sa
@@ -12,10 +13,11 @@ from sqlalchemy.exc import IntegrityError
 from apigateway import email_templates, extensions
 from apigateway.config import canonical_authority
 from apigateway.domains import canonicalize_email
+from apigateway.exceptions import AccountActionTokenError
 from apigateway.models import (
+    AccountActionToken,
     EmailChangeRequest,
     NotificationOutbox,
-    PasswordChangeRequest,
     User,
 )
 from apigateway.utils import DeliveryResult, DeliveryState, send_email, send_feedback_email
@@ -291,16 +293,21 @@ def _prepare_password_reset(job_id: int, ownership: str) -> DeliveryResult | Non
     if user is None or user.is_anonymous_bootstrap_user or not user.confirmed_at:
         return DeliveryResult("email", DeliveryState.SUPPRESSED, "account_ineligible")
 
-    # Replacing all actions while holding the user lock serializes generation
-    # against delivery, which locks the current action through SMTP acceptance.
-    session.query(PasswordChangeRequest).filter_by(user_id=user.id).delete()
-    action = PasswordChangeRequest(user_id=user.id)
-    session.add(action)
-    session.flush()
-    if session.get_bind().dialect.name == "postgresql":
-        session.execute(
-            sa.text("SELECT pg_advisory_xact_lock(:key)"), {"key": 0x4E4F54494659}
+    # The user lock serializes replacement with delivery. The persisted action
+    # contains only a digest; its bearer is deterministically derived in memory.
+    token = extensions.security_service.issue_account_action_token(
+        session,
+        user_id=user.id,
+        purpose="password_reset",
+        target_email=str(user.email),
+    )
+    action = (
+        session.query(AccountActionToken)
+        .filter_by(
+            token_digest=extensions.security_service.account_action_token_digest(token)
         )
+        .one()
+    )
 
     delivery_payload = {
         "action_id": action.delivery_id,
@@ -334,6 +341,13 @@ def _prepare_password_reset(job_id: int, ownership: str) -> DeliveryResult | Non
     job.dedupe_key = f"password-reset-delivery:{action.delivery_id}"
     session.commit()
     return None
+
+
+def _password_reset_url(verify_url: str, token: str) -> str:
+    parsed = urlsplit(verify_url)
+    prefix = parsed.fragment.rstrip("/")
+    fragment = f"{prefix}/reset-password/{token}" if prefix else f"reset-password/{token}"
+    return urlunsplit(parsed._replace(fragment=fragment))
 
 
 def _deliver(job: NotificationOutbox) -> DeliveryResult:
@@ -376,8 +390,8 @@ def _deliver(job: NotificationOutbox) -> DeliveryResult:
         )
     if job.event_type == "password_reset_action":
         candidate = (
-            session.query(PasswordChangeRequest)
-            .filter_by(delivery_id=payload["action_id"])
+            session.query(AccountActionToken)
+            .filter_by(delivery_id=payload["action_id"], purpose="password_reset")
             .first()
         )
         if candidate is None:
@@ -391,19 +405,25 @@ def _deliver(job: NotificationOutbox) -> DeliveryResult:
         if user is None:
             return DeliveryResult("email", DeliveryState.SUPPRESSED, "action_missing")
         action = (
-            session.query(PasswordChangeRequest)
-            .filter_by(delivery_id=payload["action_id"])
+            session.query(AccountActionToken)
+            .filter_by(delivery_id=payload["action_id"], purpose="password_reset")
             .with_for_update()
             .first()
         )
         if action is None or action.user_id != user.id:
             return DeliveryResult("email", DeliveryState.SUPPRESSED, "action_missing")
-        token = extensions.security_service.generate_password_token(action.delivery_id)
+        try:
+            token = extensions.security_service.derive_account_action_token(action)
+            extensions.security_service.verify_account_action_token(
+                session, token, "password_reset"
+            )
+        except AccountActionTokenError:
+            return DeliveryResult("email", DeliveryState.SUPPRESSED, "action_invalid")
         return send_email(
             current_app.config["MAIL_DEFAULT_SENDER"],
             user.email,
             email_templates.PasswordResetEmail,
-            verification_url=f"{payload['verify_url']}/reset-password/{token}",
+            verification_url=_password_reset_url(payload["verify_url"], token),
             ui_env=payload["ui_env"],
             ui_url=payload["ui_url"],
         )

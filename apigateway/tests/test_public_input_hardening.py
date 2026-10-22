@@ -334,9 +334,13 @@ def test_reset_and_resend_have_uniform_account_independent_responses(app):
         views, "enqueue_account_request", return_value=queued
     ) as enqueue, mock.patch.object(extensions.db.session, "query") as database:
         with app.test_request_context(
-            method="POST", json={"g-recaptcha-response": "token"}
+            method="POST",
+            json={
+                "email": "USER@Example.Org.",
+                "g-recaptcha-response": "token",
+            },
         ):
-            reset_response = views.ResetPasswordView().post("USER@Example.Org.")
+            reset_response = views.ResetPasswordView().post()
         with app.test_request_context(method="PUT"):
             resend_response = views.VerifyEmailView().put("USER@Example.Org.")
 

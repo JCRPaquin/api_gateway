@@ -17,10 +17,10 @@ from apigateway import email_templates as templates
 from apigateway import exceptions, extensions, schemas
 from apigateway.domains import canonicalize_email
 from apigateway.models import (
+    AccountActionToken,
     EmailChangeRequest,
     OAuth2Client,
     OAuth2Token,
-    PasswordChangeRequest,
     User,
 )
 from apigateway.notifications import (
@@ -149,9 +149,15 @@ class UserAuthView(Resource):
                 current_app.logger.info(
                     "Forcing creation of password reset action for user: %s", user.id
                 )
-                self._delete_existing_password_change_requests(session, user.id)
-                action = self._create_password_change_request(session, user.id)
-                session.flush()
+                token = extensions.security_service.issue_account_action_token(
+                    session,
+                    user_id=user.id,
+                    purpose="password_reset",
+                    target_email=str(user.email),
+                )
+                action = session.query(AccountActionToken).filter_by(
+                    token_digest=extensions.security_service.account_action_token_digest(token)
+                ).one()
                 environment = request_environment(request.headers.get("Host", ""))
                 outcome = enqueue_notification(
                     "password_reset_action",
@@ -164,8 +170,6 @@ class UserAuthView(Resource):
                     session.rollback()
                     return _queue_unavailable_response()
                 session.commit()
-
-                current_app.logger.info("Forcing password reset for user {}".format(user.email))
 
                 abort(
                     422,
@@ -187,15 +191,6 @@ class UserAuthView(Resource):
 
         return {"message": "Successfully logged in"}, 200
 
-    def _delete_existing_password_change_requests(self, session, user_id: int):
-        session.query(PasswordChangeRequest).filter(
-            PasswordChangeRequest.user_id == user_id
-        ).delete()
-
-    def _create_password_change_request(self, session, user_id: int):
-        password_change_request = PasswordChangeRequest(user_id=user_id)
-        session.add(password_change_request)
-        return password_change_request
 
 
 class CSRFView(Resource):
@@ -346,19 +341,18 @@ class ChangePasswordView(Resource):
 
 
 class ResetPasswordView(Resource):
-    def get(self, token_or_email):
-        user = extensions.security_service.verify_password_token(token=token_or_email)
-        return {"email": user.email}, 200
+    """Issue and consume password-reset account actions without URL credentials."""
+    def get(self):
+        abort(405, message="Method not allowed")
 
-    def post(self, token_or_email):
-        params = schemas.captcha_request.load(_account_body())
+    def post(self):
+        params = schemas.reset_password_initiate_request.load(_account_body())
         if not verify_recaptcha(params.g_recaptcha_response):
             return {"error": "captcha was not verified"}, 403
         try:
-            schemas.validate_public_email(token_or_email)
-            canonical_email = canonicalize_email(token_or_email)
-        except (ValueError, ValidationError):
-            return {"message": "Invalid email address"}, 400
+            canonical_email = canonicalize_email(params.email)
+        except ValueError:
+            return {"message": ACCOUNT_ACCEPTED_MESSAGE}, 202
         outcome = enqueue_account_request(
             "password_reset_request", canonical_email, request.headers.get("Host", "")
         )
@@ -366,41 +360,63 @@ class ResetPasswordView(Resource):
             return _queue_unavailable_response()
         return {"message": ACCOUNT_ACCEPTED_MESSAGE}, 202
 
-    def put(self, token_or_email):
+    def put(self):
         params = schemas.reset_password_request.load(_account_body())
 
+        committed_user_id = None
         with current_app.session_scope() as session:
             try:
-                # Resolve the account without taking the action lock, then acquire
-                # locks in the same User -> PasswordChangeRequest order as reset
-                # generation. The second lookup both locks and revalidates the
-                # exact generation named by the bearer.
-                candidate = extensions.security_service.verify_password_action(
-                    token_or_email, session=session
+                user, action = extensions.security_service.verify_account_action_token(
+                    session,
+                    params.token,
+                    "password_reset",
+                    for_update=True,
                 )
-                user = (
-                    session.query(User)
-                    .filter_by(id=candidate.user_id)
-                    .with_for_update()
-                    .one()
+                previous_session_id = user.fs_uniquifier
+                session.query(OAuth2Token).filter(
+                    OAuth2Token.user_id == previous_session_id
+                ).delete(synchronize_session=False)
+                session.query(OAuth2Client).filter(
+                    OAuth2Client.user_id == previous_session_id
+                ).delete(synchronize_session=False)
+                extensions.security_service.set_password_in_transaction(
+                    user, params.password1
                 )
-                action = extensions.security_service.verify_password_action(
-                    token_or_email, session=session, for_update=True
-                )
-                if action.user_id != user.id:
-                    raise ValueError("password reset action account changed")
-
-                user = extensions.security_service.change_password(
-                    user, params.password1, session=session, commit=False
-                )
+                user.fs_uniquifier = gen_salt(64)
                 session.delete(action)
+                committed_user_id = user.id
                 session.commit()
+            except exceptions.AccountActionTokenError as error:
+                session.rollback()
+                return {"message": error.value}, 400
             except Exception:
                 session.rollback()
                 raise
 
-            login_user(user)
-            return {"message": "success"}, 200
+        user = User.query.filter_by(id=committed_user_id).one()
+        login_user(user)
+        return {"message": "success"}, 200
+
+
+class ResetPasswordVerifyView(Resource):
+    """Inspect a password-reset capability without consuming it."""
+    def get(self):
+        abort(405, message="Method not allowed")
+
+
+    def post(self):
+        params = schemas.account_action_token_request.load(_account_body())
+        with current_app.session_scope() as session:
+            try:
+                user, _ = extensions.security_service.verify_account_action_token(
+                    session,
+                    params.token,
+                    "password_reset",
+                )
+            except exceptions.AccountActionTokenError as error:
+                session.rollback()
+                return {"message": error.value}, 400
+            return {"email": user.email}, 200
 
 
 class ChangeEmailView(Resource):

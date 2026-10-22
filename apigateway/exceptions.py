@@ -23,6 +23,14 @@ class ValidationError(Exception):
         return repr(self.value)
 
 
+class AccountActionTokenError(Exception):
+    """Raised when an account-action capability is invalid or expired."""
+
+    def __init__(self):
+        self.value = "Invalid or expired account action token"
+        super().__init__(self.value)
+
+
 class NoClientError(Exception):
     """
     Exception raised when no oauth2client is found, but was expected

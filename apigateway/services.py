@@ -1,6 +1,7 @@
 """Module defining API Gateway services."""
 
 import hashlib
+import hmac
 import json
 import logging
 import math
@@ -9,7 +10,7 @@ import re
 import threading
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from functools import wraps
 from typing import Callable, Tuple
 from urllib.parse import urljoin
@@ -26,7 +27,7 @@ from flask_limiter.extension import LimitDecorator
 from flask_limiter.util import get_remote_address
 from flask_login import current_user
 from flask_security import Security, SQLAlchemyUserDatastore
-from itsdangerous import URLSafeTimedSerializer
+from itsdangerous import URLSafeSerializer, URLSafeTimedSerializer
 from kafka import KafkaProducer
 from redis import Redis, StrictRedis
 from redis.exceptions import ConnectionError, TimeoutError
@@ -36,16 +37,22 @@ from werkzeug.security import gen_salt
 
 from apigateway import extensions
 from apigateway.domains import canonicalize_email
-from apigateway.exceptions import NoClientError, NotFoundError, ValidationError
+from apigateway.exceptions import (
+    AccountActionTokenError,
+    NoClientError,
+    NotFoundError,
+    ValidationError,
+)
 from apigateway.models import (
+    AccountActionToken,
     AnonymousUser,
     OAuth2Client,
     OAuth2Token,
-    PasswordChangeRequest,
     Role,
     User,
 )
 from apigateway.utils import GatewayResourceProtector, ProxyView
+
 
 
 class GatewayService:
@@ -1242,6 +1249,26 @@ class SecurityService(GatewayService, Security):
 
 
     """
+    ACCOUNT_ACTION_PURPOSES = frozenset(
+        ("password_reset", "verify_registration", "change_email")
+    )
+    _ACCOUNT_ACTION_SALT_CONFIG = {
+        "password_reset": "VERIFY_PASSWORD_SALT",
+        "verify_registration": "VERIFY_EMAIL_SALT",
+        "change_email": "VERIFY_EMAIL_SALT",
+    }
+    _ACCOUNT_ACTION_PAYLOAD_KEYS = frozenset(
+        (
+            "version",
+            "user_id",
+            "purpose",
+            "nonce",
+            "target_email",
+            "state_digest",
+        )
+    )
+    _ACCOUNT_ACTION_VERSION = 1
+
 
     def __init__(self, name: str = "SECURITY_SERVICE"):
         GatewayService.__init__(self, name)
@@ -1266,6 +1293,9 @@ class SecurityService(GatewayService, Security):
         )
 
         self._token_serializer = URLSafeTimedSerializer(self.get_service_config("SECRET_KEY"))
+        self._account_action_serializer = URLSafeSerializer(
+            self.get_service_config("SECRET_KEY")
+        )
 
     def create_user(self, email: str, password: str, commit: bool = True, **kwargs) -> User:
         """Creates a new user with the specified email and password.
@@ -1330,37 +1360,21 @@ class SecurityService(GatewayService, Security):
         else:
             return False
 
-    def change_password(
-        self, user: User, password: str, session=None, commit: bool = True
-    ) -> User:
-        """
-        Change the password for a given user.
-
-        Args:
-            user (User): The user object for which to change the password.
-            password (str): The new password to set for the user.
-            session: Optional database session that owns the surrounding transaction.
-            commit (bool): Commit immediately. Callers coordinating other mutations
-                in the same transaction must pass ``False``.
-
-        Raises:
-            ValueError: If the new password is invalid.
-
-        Returns:
-            User: The updated user object.
-        """
+    def set_password_in_transaction(self, user: User, password: str) -> User:
+        """Validate and hash a password without committing the caller's transaction."""
         pbad, password = self._password_util.validate(password, True)
-
         if pbad is not None:
             raise ValueError(", ".join(pbad))
-
-        session = session or self.datastore.db.session
-        user = session.merge(user)
         user.password = password
-        if commit:
-            session.commit()
-
         return user
+
+    def change_password(self, user: User, password: str) -> User:
+        """Change a password and commit for non-account-action callers."""
+        user = self.datastore.db.session.merge(user)
+        self.set_password_in_transaction(user, password)
+        self.datastore.commit()
+        return user
+
 
     def validate_email(self, email: str) -> bool:
         """
@@ -1399,96 +1413,308 @@ class SecurityService(GatewayService, Security):
         return user
 
     def generate_email_token(self, user_id: str = None) -> str:
-        """
-        Generate an email verification token for the provided user.
-
-        If no user id is provided, the current user is used.
-
-        Returns:
-            str: The email verification token.
-        """
+        """Generate a legacy email verification token."""
         if user_id is None:
             user_id = current_user.id
-
-        return self.generate_token(user_id, salt=self.get_service_config("VERIFY_EMAIL_SALT"))
-
-    def generate_password_token(self, action_id: str) -> str:
-        """Generate a short-lived signed bearer for a committed reset action."""
-        try:
-            action_id = str(uuid.UUID(action_id))
-        except (ValueError, TypeError, AttributeError) as exc:
-            raise ValueError("A committed password reset action is required") from exc
-        current_app.logger.info(
-            "Generating password token for reset action: %s", action_id
-        )
         return self.generate_token(
-            action_id, salt=self.get_service_config("VERIFY_PASSWORD_SALT")
+            user_id, salt=self.get_service_config("VERIFY_EMAIL_SALT")
         )
 
     def generate_token(self, content: str, salt: str):
-        """
-        Generate a token for the given content and salt.
-
-        Returns:
-            str: The generated token.
-        """
+        """Generate a legacy email token."""
         return self._token_serializer.dumps(content, salt=salt)
 
-    def verify_password_action(
-        self, token: str, session=None, for_update: bool = False
-    ) -> PasswordChangeRequest:
-        """Verify a reset bearer and load the committed action it identifies."""
-        salt = self.get_service_config("VERIFY_PASSWORD_SALT")
-        action_id = self._load_token(token, salt)
+    @staticmethod
+    def account_action_token_digest(token: str) -> str:
+        """Return the complete bearer token's SHA-256 digest."""
+        if not isinstance(token, str) or not token:
+            raise AccountActionTokenError()
         try:
-            action_id = str(uuid.UUID(action_id))
-        except (ValueError, TypeError, AttributeError) as exc:
-            raise ValueError("unknown verification token") from exc
-        session = session or self.datastore.db.session
-        query = session.query(PasswordChangeRequest).filter_by(delivery_id=action_id)
-        if for_update:
-            query = query.with_for_update()
-        action = query.first()
-        if action is None:
-            raise NotFoundError("no action associated with that verification token")
-        return action
+            return hashlib.sha256(token.encode("utf-8")).hexdigest()
+        except UnicodeError:
+            raise AccountActionTokenError()
 
-    def verify_password_token(self, token: str) -> User:
-        """Verify a reset bearer and return its action's user."""
-        return self.verify_password_action(token).user
+    @staticmethod
+    def _utc_datetime(value: datetime) -> datetime:
+        if not isinstance(value, datetime):
+            raise AccountActionTokenError()
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+    @staticmethod
+    def normalize_account_email(email: str) -> str:
+        if not isinstance(email, str):
+            raise ValueError("account actions require an email target")
+        try:
+            normalized = canonicalize_email(email)
+        except ValueError as exc:
+            raise ValueError("account actions require a canonical email target") from exc
+        if len(normalized) > 255:
+            raise ValueError("account actions require a bounded email target")
+        return normalized
+
+    def _account_action_state_digest(self, user: User, purpose: str) -> str:
+        state = json.dumps(
+            {
+                "active": bool(user.active),
+                "confirmed": user.confirmed_at is not None,
+                "email": self.normalize_account_email(str(user.email)),
+                "password": user.password or "",
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hmac.new(
+            self._account_action_salt(purpose).encode("utf-8"),
+            state,
+            hashlib.sha256,
+        ).hexdigest()
+
+    def _validate_account_action_target(self, target_email) -> str:
+        return self.normalize_account_email(target_email)
+
+    def _account_action_salt(self, purpose: str) -> str:
+        config_key = self._ACCOUNT_ACTION_SALT_CONFIG.get(purpose)
+        if config_key is None:
+            raise AccountActionTokenError()
+        configured_salt = self.get_service_config(config_key)
+        return "account-action:{}:{}".format(purpose, configured_salt)
+
+    def issue_account_action_token(
+        self,
+        session,
+        *,
+        user: User = None,
+        user_id: int = None,
+        purpose: str,
+        target_email,
+        now: datetime = None,
+    ) -> str:
+        """Issue and persist one target-bound account-action capability."""
+        if (user is None) == (user_id is None):
+            raise ValueError("provide exactly one of user or user_id")
+        if user is not None:
+            user_id = user.id
+        if type(user_id) is not int or user_id <= 0:
+            raise ValueError("account action tokens require a persisted user")
+        if purpose not in self.ACCOUNT_ACTION_PURPOSES:
+            raise ValueError("unknown account action purpose")
+        target_email = self._validate_account_action_target(target_email)
+
+        locked_user = (
+            session.query(User)
+            .populate_existing()
+            .filter(User.id == user_id)
+            .with_for_update()
+            .one_or_none()
+        )
+        if locked_user is None:
+            raise ValueError("account action user does not exist")
+        if purpose == "password_reset":
+            if (
+                locked_user.is_anonymous_bootstrap_user
+                or not locked_user.active
+                or locked_user.confirmed_at is None
+            ):
+                raise ValueError("user is not eligible for password reset")
+            if target_email != self.normalize_account_email(str(locked_user.email)):
+                raise ValueError("password reset target does not match the user")
+        state_digest = self._account_action_state_digest(locked_user, purpose)
+
+        issued_at = self._utc_datetime(now or datetime.now(timezone.utc))
+        expires_in = self.get_service_config(
+            "ACCOUNT_ACTION_TOKEN_EXPIRES", 24 * 60 * 60
+        )
+        if type(expires_in) is not int or expires_in <= 0:
+            raise ValueError("account action token expiry must be a positive integer")
+        expires_at = issued_at + timedelta(seconds=expires_in)
+        delivery_id = str(uuid.uuid4())
+        token = self._serialize_account_action_token(
+            user_id=locked_user.id,
+            purpose=purpose,
+            target_email=target_email,
+            state_digest=state_digest,
+            delivery_id=delivery_id,
+        )
+
+        session.query(AccountActionToken).filter(
+            AccountActionToken.user_id == locked_user.id,
+            AccountActionToken.purpose == purpose,
+        ).delete(synchronize_session=False)
+        session.add(
+            AccountActionToken(
+                delivery_id=delivery_id,
+                token_digest=self.account_action_token_digest(token),
+                user_id=locked_user.id,
+                purpose=purpose,
+                target_email=target_email,
+                state_digest=state_digest,
+                issued_at=issued_at,
+                expires_at=expires_at,
+            )
+        )
+        session.flush()
+        return token
+
+    def _account_action_nonce(self, purpose: str, delivery_id: str) -> str:
+        return hmac.new(
+            self._account_action_salt(purpose).encode("utf-8"),
+            delivery_id.encode("ascii"),
+            hashlib.sha256,
+        ).hexdigest()
+
+    def _serialize_account_action_token(
+        self,
+        *,
+        user_id: int,
+        purpose: str,
+        target_email: str,
+        state_digest: str,
+        delivery_id: str,
+    ) -> str:
+        payload = {
+            "version": self._ACCOUNT_ACTION_VERSION,
+            "user_id": user_id,
+            "purpose": purpose,
+            "nonce": self._account_action_nonce(purpose, delivery_id),
+            "target_email": target_email,
+            "state_digest": state_digest,
+        }
+        return self._account_action_serializer.dumps(
+            payload, salt=self._account_action_salt(purpose)
+        )
+
+    def derive_account_action_token(self, action: AccountActionToken) -> str:
+        """Derive a bearer in memory from the exact persisted action."""
+        token = self._serialize_account_action_token(
+            user_id=action.user_id,
+            purpose=action.purpose,
+            target_email=action.target_email,
+            state_digest=action.state_digest,
+            delivery_id=action.delivery_id,
+        )
+        if not hmac.compare_digest(
+            self.account_action_token_digest(token), action.token_digest
+        ):
+            raise AccountActionTokenError()
+        return token
+
+    def _decode_account_action_token(self, token: str, purpose: str) -> dict:
+        if purpose not in self.ACCOUNT_ACTION_PURPOSES:
+            raise AccountActionTokenError()
+        if not isinstance(token, str) or not token:
+            raise AccountActionTokenError()
+        try:
+            payload = self._account_action_serializer.loads(
+                token, salt=self._account_action_salt(purpose)
+            )
+        except Exception:
+            self._logger.warning("Account action token rejected")
+            raise AccountActionTokenError()
+        if type(payload) is not dict or set(payload) != self._ACCOUNT_ACTION_PAYLOAD_KEYS:
+            raise AccountActionTokenError()
+        if (
+            type(payload["version"]) is not int
+            or payload["version"] != self._ACCOUNT_ACTION_VERSION
+        ):
+            raise AccountActionTokenError()
+        if type(payload["user_id"]) is not int or payload["user_id"] <= 0:
+            raise AccountActionTokenError()
+        if payload["purpose"] != purpose:
+            raise AccountActionTokenError()
+        nonce = payload["nonce"]
+        if (
+            not isinstance(nonce, str)
+            or not 32 <= len(nonce) <= 128
+            or re.fullmatch(r"[A-Za-z0-9_-]+", nonce) is None
+        ):
+            raise AccountActionTokenError()
+        try:
+            self._validate_account_action_target(payload["target_email"])
+        except ValueError:
+            raise AccountActionTokenError()
+        state_digest = payload["state_digest"]
+        if (
+            not isinstance(state_digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", state_digest) is None
+        ):
+            raise AccountActionTokenError()
+        return payload
+
+    def verify_account_action_token(
+        self,
+        session,
+        token: str,
+        purpose: str,
+        *,
+        for_update: bool = False,
+        now: datetime = None,
+    ) -> Tuple[User, AccountActionToken]:
+        """Verify a capability and return its locked or read-only state."""
+        payload = self._decode_account_action_token(token, purpose)
+        user_query = session.query(User).filter(User.id == payload["user_id"])
+        user_query = user_query.populate_existing()
+        if for_update:
+            user_query = user_query.with_for_update()
+        user = user_query.one_or_none()
+        if user is None:
+            raise AccountActionTokenError()
+
+        digest = self.account_action_token_digest(token)
+        action_query = (
+            session.query(AccountActionToken)
+            .filter(AccountActionToken.token_digest == digest)
+            .populate_existing()
+        )
+        if for_update:
+            action_query = action_query.with_for_update()
+        action = action_query.one_or_none()
+        if (
+            action is None
+            or action.user_id != user.id
+            or action.purpose != purpose
+            or action.target_email != payload["target_email"]
+            or not isinstance(action.state_digest, str)
+            or not hmac.compare_digest(
+                action.state_digest, payload["state_digest"]
+            )
+        ):
+            raise AccountActionTokenError()
+
+        try:
+            current_state_digest = self._account_action_state_digest(user, purpose)
+            current_email = self.normalize_account_email(str(user.email))
+        except (TypeError, ValueError):
+            raise AccountActionTokenError()
+        if not hmac.compare_digest(current_state_digest, action.state_digest):
+            raise AccountActionTokenError()
+        if purpose == "password_reset" and (
+            not user.active
+            or user.confirmed_at is None
+            or current_email != action.target_email
+        ):
+            raise AccountActionTokenError()
+
+        checked_at = self._utc_datetime(now or datetime.now(timezone.utc))
+        issued_at = self._utc_datetime(action.issued_at)
+        expires_at = self._utc_datetime(action.expires_at)
+        if issued_at >= expires_at or checked_at >= expires_at:
+            raise AccountActionTokenError()
+        return user, action
 
     def verify_email_token(self, token: str) -> User:
-        """
-        Verifies the email confirmation token and returns the associated user.
-
-        Args:
-            token (str): The email confirmation token to verify.
-
-        Returns:
-            User: The user associated with the token if it's valid, None otherwise.
-        """
+        """Verify a legacy email token."""
         salt = self.get_service_config("VERIFY_EMAIL_SALT")
         return self.verify_token(token, salt)
 
-    def _load_token(self, token: str, salt: str):
-        try:
-            return self._token_serializer.loads(token, max_age=86400, salt=salt)
-        except Exception as ex:
-            self._logger.warning(
-                "Verification token was not validated. Reason: %s",
-                ex.__class__.__name__,
-            )
-            raise ValueError("unknown verification token") from ex
-
     def verify_token(self, token: str, salt: str) -> User:
-        """
-        Verify an account token and return its associated user.
-
-        Raises ValueError for invalid or expired bearers and NotFoundError when
-        the signed user identifier no longer exists.
-        """
-        user_id = self._load_token(token, salt)
-        current_app.logger.info("Verifying token for user: %s", user_id)
+        """Verify a legacy email token and return its user."""
+        try:
+            user_id = self._token_serializer.loads(token, max_age=86400, salt=salt)
+        except Exception:
+            self._logger.warning("Verification token rejected")
+            raise ValueError("unknown verification token")
         user: User = User.query.filter_by(id=user_id).first()
         if user is None:
             raise NotFoundError("no user associated with that verification token")

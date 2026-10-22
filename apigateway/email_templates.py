@@ -173,7 +173,7 @@ Copy and paste the link below into your browser to reset it.
 
 {endpoint}
 
-This link is only valid for the next 24 hours.
+This link is valid only for a limited time.
 
 If you didn't request this, you can safely ignore this email.
 
@@ -186,7 +186,7 @@ account associated with this email address. Click the link below to reset it:</p
 
 {open_tag}<a href="{endpoint}">{endpoint}</a></p>
 
-{open_tag}This link is only valid for the next 24 hours.</p>
+{open_tag}This link is valid only for a limited time.</p>
 
 {open_tag}If you didn't request this, you can safely ignore this email.</p>
 

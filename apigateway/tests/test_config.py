@@ -42,6 +42,7 @@ def valid_runtime_config(**overrides):
         "SESSION_COOKIE_SAMESITE": "Lax",
         "HTTPS_ENFORCEMENT": True,
         "TRUSTED_PROXY_HOPS": 0,
+        "SECURITY_SERVICE_ACCOUNT_ACTION_TOKEN_EXPIRES": 24 * 60 * 60,
     }
     config.update(overrides)
     return config
@@ -247,6 +248,13 @@ def test_testing_cannot_disable_https_without_factory_escape():
 def test_trusted_proxy_hops_are_explicit_nonnegative_integers(hops):
     config = valid_runtime_config(TRUSTED_PROXY_HOPS=hops)
     assert_invalid(config, "TRUSTED_PROXY_HOPS")
+
+@pytest.mark.parametrize("expires", [True, 0, -1, "86400"])
+def test_account_action_expiry_is_a_positive_integer(expires):
+    config = valid_runtime_config(
+        SECURITY_SERVICE_ACCOUNT_ACTION_TOKEN_EXPIRES=expires
+    )
+    assert_invalid(config, "SECURITY_SERVICE_ACCOUNT_ACTION_TOKEN_EXPIRES")
 
 
 def test_attacker_shadow_host_is_rejected_before_route(app):

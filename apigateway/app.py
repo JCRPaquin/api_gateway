@@ -47,6 +47,20 @@ class GatewayApi(Api):
             return _request_too_large_response()
         return super().handle_error(error)
 
+SENSITIVE_ACCOUNT_ENDPOINTS = frozenset(
+    {
+        "account_bootstrap",
+        "account_csrf",
+        "account_login",
+        "account_personal_token",
+        "account_change_password",
+        "account_change_email",
+        "account_verify_email",
+        "account_reset_password",
+        "account_reset_password_verify",
+    }
+)
+
 
 def register_extensions(app: Flask):
     """Register extensions.
@@ -120,6 +134,14 @@ def register_hooks(app: Flask):
     def make_session_permanent():
         session.permanent = True
 
+
+    @app.after_request
+    def prevent_sensitive_response_storage(response):
+        if request.endpoint in SENSITIVE_ACCOUNT_ENDPOINTS:
+            response.headers["Cache-Control"] = "no-store"
+            response.headers["Pragma"] = "no-cache"
+        return response
+
     @app.login_manager.user_loader
     def load_user(user_id):
         return User.query.filter_by(fs_uniquifier=user_id).first()
@@ -173,6 +195,10 @@ def register_error_handlers(app: Flask):
 
     @app.errorhandler(exceptions.ValidationError)
     def validation_error(e):
+        return jsonify({"message": e.value}), 400
+
+    @app.errorhandler(exceptions.AccountActionTokenError)
+    def invalid_account_action_token(e):
         return jsonify({"message": e.value}), 400
 
     @app.errorhandler(exceptions.NoClientError)
@@ -238,26 +264,49 @@ def register_verbose_exception_logging(app: Flask):
 
 def register_views(flask_api: Api):
     """Registers the views for the Flask application."""
-    flask_api.add_resource(views.BootstrapView, "/accounts/bootstrap")
-    flask_api.add_resource(views.CSRFView, "/accounts/csrf")
+    flask_api.add_resource(
+        views.BootstrapView, "/accounts/bootstrap", endpoint="account_bootstrap"
+    )
+    flask_api.add_resource(views.CSRFView, "/accounts/csrf", endpoint="account_csrf")
     flask_api.add_resource(views.StatusView, "/accounts/status")
     flask_api.add_resource(views.OAuthProtectedView, "/accounts/protected")
-    flask_api.add_resource(views.UserAuthView, "/accounts/user/login")
+    flask_api.add_resource(
+        views.UserAuthView, "/accounts/user/login", endpoint="account_login"
+    )
     flask_api.add_resource(views.LogoutView, "/accounts/user/logout")
     flask_api.add_resource(views.UserManagementView, "/accounts/user")
     flask_api.add_resource(views.UserResolverView, "/accounts/user/<string:id>")
-    flask_api.add_resource(views.PersonalTokenView, "/accounts/user/token")
-    flask_api.add_resource(views.ChangePasswordView, "/accounts/user/change-password")
-    flask_api.add_resource(views.ChangeEmailView, "/accounts/user/change-email")
+    flask_api.add_resource(
+        views.PersonalTokenView,
+        "/accounts/user/token",
+        endpoint="account_personal_token",
+    )
+    flask_api.add_resource(
+        views.ChangePasswordView,
+        "/accounts/user/change-password",
+        endpoint="account_change_password",
+    )
+    flask_api.add_resource(
+        views.ChangeEmailView,
+        "/accounts/user/change-email",
+        endpoint="account_change_email",
+    )
 
     flask_api.add_resource(
         views.VerifyEmailView,
         "/accounts/verify/<string:token>",
         "/accounts/user/<string:email>/verify",
+        endpoint="account_verify_email",
     )
     flask_api.add_resource(
         views.ResetPasswordView,
-        "/accounts/user/reset-password/<string:token_or_email>",
+        "/accounts/user/reset-password",
+        endpoint="account_reset_password",
+    )
+    flask_api.add_resource(
+        views.ResetPasswordVerifyView,
+        "/accounts/user/reset-password/verify",
+        endpoint="account_reset_password_verify",
     )
     flask_api.add_resource(views.UserInfoView, "/accounts/info/<string:account_data>")
     flask_api.add_resource(views.ChacheManagementView, "/admin/cache")
