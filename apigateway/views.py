@@ -481,28 +481,17 @@ class VerifyEmailView(Resource):
 
 
 class ChacheManagementView(Resource):
-    """A view for managing the cache.
+    """Invalidate every cached representation for a route.
 
-    This class provides an API endpoint for clearing the cache based on the provided key and parameters.
-
-
-    Examples:
-
-    Clearing the cache for a specific resource and parameters:
-
-    DELETE
-    {
-        "key": "/scan/metadata/article/extra/123",
-        "parameters": {"test": "123"}
-    }
-
+    DELETE with ``{"key": "/scan/metadata/article/123"}`` bumps the
+    route generation. ``{"key": "*"}`` clears the complete proxy cache.
     """
 
     decorators = [extensions.auth_service.require_oauth("adsws:internal")]
 
     def delete(self):
         params = schemas.clear_cache_request.load(get_json_body(request))
-        extensions.cache_service.clear_cache(params.key, params.parameters)
+        extensions.cache_service.clear_cache(params.key)
         return {"message": "success"}, 200
 
 

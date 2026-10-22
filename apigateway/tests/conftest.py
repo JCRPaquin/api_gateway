@@ -20,7 +20,7 @@ def app(request):
             "PRESERVE_CONTEXT_ON_EXCEPTION": False,
             "PROXY_SERVICE_WEBSERVICES": {},
             "BOOTSTRAP_TOKEN_EXPIRES": 3600,
-            "PROXY_SERVICE_ALLOWED_HEADERS": ["test_allowed_header"],
+            "PROXY_SERVICE_RESPONSE_HEADERS": ["Content-Type", "Location"],
             "LIMITER_SERVICE_SCALING_COST_ENABLED": False,
         },
         name=request.node.name,

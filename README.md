@@ -8,6 +8,89 @@ SciX API Gateway, the core API module for SciX.
 
 The gateway supports CPython 3.12 only (`>=3.12,<3.13`); CI and the container use Python 3.12.15. Flit is the sole package build backend, with its exact backend version declared in `pyproject.toml`; `setup.py`, wheel, and ppsetuptools are not gateway build paths.
 
+## Secure discovery, proxy, cache, and mail boundaries
+
+Proxy discovery is disabled by default. `PROXY_SERVICE_WEBSERVICES` is now a
+mapping of service names to records; the former `{url: deploy_path}` format and
+the former backend-controlled resource properties are intentionally
+incompatible. A deployment record must contain an HTTPS `base_url`, canonical
+`deploy_path`, purpose-specific `discovery_hmac_key`, and local `policy`.
+Discovery documents have the fixed schema
+`{"version": 1, "routes": [{"path": "/route", "methods": ["GET"]}]}`.
+Authorization, scopes, methods, CSRF handling, rate limits, and cache
+eligibility are always bounded by local policy and cannot be supplied by
+discovery. Registration rejects collisions with static or dynamic local
+routes, including the implicit `HEAD` method provided by every `GET` route.
+
+The discovery signer sends `X-Discovery-Timestamp` and
+`X-Discovery-Signature: v1=<hex HMAC-SHA256>`, where the signed bytes are
+`<timestamp> + "\\n" + <exact response body>`. Rotate this key with a
+coordinated signer and gateway configuration rollout; it must not be reused for
+sessions or any other purpose. `discovery_cache: true` explicitly permits
+startup fallback, but the cached body, timestamp, and signature are verified
+again and become unusable after
+`PROXY_SERVICE_DISCOVERY_MAX_AGE_SECONDS`. Redirected, stale, oversized,
+unsigned, malformed, or non-HTTPS discovery fails application startup.
+
+Proxy origins use HTTPS certificate and hostname verification. Configure
+`PROXY_SERVICE_TLS_CA_BUNDLE` (or a per-service `tls_ca_bundle`) with the
+internal CA file when system trust is insufficient. Client certificate and key
+settings must be provided together. The proxy has separate connect/read
+inactivity timeouts plus one monotonic whole-response deadline. A request-local
+transport wrapper recomputes the remaining time before every socket receive,
+including proxy `CONNECT`, upstream status/header parsing, HTTP chunk framing,
+and body reads; pooled connections receive a fresh deadline before reuse.
+The transport adapter depends on Requests adapter integration and urllib3's
+private connection and pool extension APIs. `requests==2.34.2` and
+`urllib3==2.8.0` are therefore direct, exact dependencies and form the tested
+pair; update them together only after rerunning the deadline transport tests.
+Request/wire/decoded byte ceilings, header count/byte ceilings, and explicit
+request/response header allowlists also apply. It accepts compressed
+responses only when the complete gzip or deflate representation is valid;
+concatenated gzip members share one decoded-byte ceiling. It never forwards
+browser cookies, authorization, caller Host, forwarding fields, proxy
+authorization, or hop-by-hop headers, and it never follows upstream redirects.
+
+Only locally declared unauthenticated public `GET` routes may be cached, with a
+TTL of 1–300 seconds and finite local grammars. `query_parameters` maps each
+permitted name to its exact finite value set; query names are single-valued,
+count/length bounded, and repeated, unknown, undeclared, or noncanonical raw
+query encodings bypass the cache. `representation_headers` declares exact,
+case-preserving values for every forwarded representation header (an empty
+value list permits only absence). Requests whose `Connection` field would
+remove a keyed header also bypass the cache. Arbitrary language, media-type,
+and content-type variants therefore bypass both reads and writes. Credentials,
+identity, bodies, ranges, request `no-cache`/`no-store`, unsupported cache
+directives, and zero `max-age` also bypass caching.
+
+Partial, streaming, private, `no-store`, `no-cache`, expired, zero-age,
+`Set-Cookie`, and unsupported `Vary` responses are not stored. Corrected
+initial age includes origin response delay as well as origin `Age` and `Date`;
+`s-maxage`, `max-age`, and `Expires` bound freshness. Cache hits sample time
+after retrieval, recompute current age, enforce request `max-age` and
+`min-fresh`, and emit an updated `Age`. Objects above
+`PROXY_SERVICE_MAX_CACHE_OBJECT_BYTES` remain bounded streams and are not
+cached. Keys contain only exact canonical query pairs and exact finite
+representation dimensions, plus service, method, path, and route generation.
+Cache invalidation accepts only a route key (or `*`).
+
+Production must use a Redis instance dedicated to this public response cache,
+with an operator-selected finite `maxmemory` and eviction policy. Redis DB
+numbers do not provide memory isolation. The repository Compose Redis is a
+shared development dependency and is not a production cache topology.
+
+Every proxy `deploy_path` must be a non-root, single-segment top-level prefix.
+Before registration, each concrete discovered path and method is resolved
+through Werkzeug's bound application matcher; any existing static or converter
+match is rejected.
+
+SMTP is disabled until `MAIL_SERVER` is set. When enabled it requires
+`MAIL_SECURITY` to be `implicit_tls` or `starttls`, validates the server through
+the system trust store or `MAIL_TLS_CA_FILE`, applies `MAIL_TIMEOUT_SECONDS`,
+and requires `MAIL_USERNAME` and `MAIL_PASSWORD`. There is no plaintext or
+unauthenticated downgrade. Provision discovery keys, CA files, proxy policy,
+and SMTP credentials before deploying this release.
+
 Install the environment from the reviewed lock with uv 0.12.13:
 
 ```bash

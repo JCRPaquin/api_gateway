@@ -137,7 +137,6 @@ class UpdateUserRequestSchema:
 @dataclass
 class ClearCacheRequestSchema:
     key: str = field()
-    parameters: dict = None
 
 
 @dataclass

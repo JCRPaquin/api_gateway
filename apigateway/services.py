@@ -1,16 +1,17 @@
 """Module defining API Gateway services."""
 
 import hashlib
+import hmac
 import json
 import logging
 import math
-import os
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from functools import wraps
 from typing import Callable, Tuple
-from urllib.parse import urljoin
+from urllib.parse import urlencode, urlsplit, urlunsplit
 
 import requests
 from authlib.integrations.flask_oauth2 import current_token, token_authenticated
@@ -30,6 +31,8 @@ from redis import Redis, StrictRedis
 from redis.exceptions import ConnectionError, TimeoutError
 from sqlalchemy import func
 from werkzeug.datastructures import Headers
+from werkzeug.exceptions import MethodNotAllowed, NotFound
+from werkzeug.routing import RequestRedirect
 from werkzeug.security import gen_salt
 
 from apigateway import extensions
@@ -390,142 +393,539 @@ class AuthService(GatewayService):
 
 
 class ProxyService(GatewayService):
-    """A class for registering remote webservices and resources with the Flask application."""
+    """Register authenticated discovery routes under strict local policy."""
+
+    _SUPPORTED_METHODS = {
+        "GET",
+        "HEAD",
+        "POST",
+        "PUT",
+        "PATCH",
+        "DELETE",
+        "OPTIONS",
+    }
 
     def __init__(self, name: str = "PROXY_SERVICE"):
         super().__init__(name)
 
-    def register_services(self):
-        """Registers all services specified in the configuration file."""
-        self.allowed_headers = self.get_service_config("ALLOWED_HEADERS", [])
+    @staticmethod
+    def _canonical_path(path: str, *, field: str) -> str:
+        if not isinstance(path, str) or not path.startswith("/"):
+            raise RuntimeError(f"{field} must be an absolute URL path")
+        if len(path) > 256 or (path != "/" and path.endswith("/")):
+            raise RuntimeError(f"{field} is not canonical")
+        if (
+            "\\" in path
+            or "%" in path
+            or "?" in path
+            or "#" in path
+            or "<" in path
+            or ">" in path
+            or "//" in path
+            or any(ord(character) < 32 or ord(character) == 127 for character in path)
+        ):
+            raise RuntimeError(f"{field} contains an ambiguous URL path")
+        if any(segment in {".", ".."} for segment in path.split("/")):
+            raise RuntimeError(f"{field} contains a dot segment")
+        return path
 
-        services = self.get_service_config("WEBSERVICES", {})
-        for url, deploy_path in services.items():
-            self.register_service(url, deploy_path)
-
-        self._register_hooks(self._app)
-
-    def _register_hooks(self, app: Flask):
-        """Registers hooks that manipulate the response headers.
-
-        Args:
-            app (Flask): The Flask app to register hooks for.
-        """
-
-        @app.after_request
-        def _after_request_hook(response: Response):
-            filtered_headers = {
-                key: value
-                for key, value in response.headers.items()
-                if key in self.allowed_headers
-            }
-
-            response.headers.clear()
-
-            for key, value in filtered_headers.items():
-                response.headers.add_header(key, value)
-
-            return response
-
-    def register_service(self, base_url: str, deploy_path: str, csrf_exempt: bool = True):
-        """Registers a single service with the Flask application
-
-        Args:
-            base_url (str): The base URL of the service.
-            deploy_path (str): The deployment path of the service
-            csrf_exempt (bool, optional): Whether to exempt the services from CSRF protection. Defaults to True.
-        """
-        self._logger.info("Registering service %s at %s", base_url, deploy_path)
+    @staticmethod
+    def _strict_json(raw: bytes):
+        def reject_duplicates(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise RuntimeError("Discovery document contains duplicate keys")
+                result[key] = value
+            return result
 
         try:
-            resource_json = self._fetch_resource_document(base_url)
-        except requests.exceptions.RequestException as ex:
-            self._logger.error("Could not fetch resource document for %s: %s", base_url, ex)
-            return
+            return json.loads(raw.decode("utf-8"), object_pairs_hook=reject_duplicates)
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
+            raise RuntimeError("Discovery document is not valid bounded UTF-8 JSON") from error
 
-        self._logger.info("Discovered %s endpoints:", deploy_path)
-        for remote_path, properties in resource_json.items():
-            self._logger.info("- %s", remote_path)
+    def _validate_document_shape(self, document):
+        max_depth = self.get_service_config("DISCOVERY_MAX_JSON_DEPTH", 8)
+        max_entries = self.get_service_config("DISCOVERY_MAX_JSON_ENTRIES", 2048)
+        max_fields = self.get_service_config("DISCOVERY_MAX_FIELDS", 1024)
+        entries = 0
+        fields = 0
 
-            properties.setdefault(
-                "rate_limit",
-                self.get_service_config("DEFAULT_RATE_LIMIT", [1000, 86400]),
+        def visit(value, depth):
+            nonlocal entries, fields
+            if depth > max_depth:
+                raise RuntimeError("Discovery document exceeds JSON depth limit")
+            if isinstance(value, dict):
+                fields += len(value)
+                entries += len(value)
+                if fields > max_fields:
+                    raise RuntimeError("Discovery document exceeds field limit")
+                for child in value.values():
+                    visit(child, depth + 1)
+            elif isinstance(value, list):
+                entries += len(value)
+                for child in value:
+                    visit(child, depth + 1)
+            if entries > max_entries:
+                raise RuntimeError("Discovery document exceeds entry limit")
+
+        visit(document, 1)
+
+    def _validate_document(self, raw: bytes) -> list:
+        document = self._strict_json(raw)
+        self._validate_document_shape(document)
+        if (
+            not isinstance(document, dict)
+            or set(document) != {"version", "routes"}
+            or type(document["version"]) is not int
+            or document["version"] != 1
+            or not isinstance(document["routes"], list)
+        ):
+            raise RuntimeError("Discovery document does not match schema version 1")
+        routes = document["routes"]
+        if len(routes) > self.get_service_config("DISCOVERY_MAX_ROUTES", 256):
+            raise RuntimeError("Discovery document has too many routes")
+
+        seen_paths = set()
+        validated = []
+        for route in routes:
+            if not isinstance(route, dict) or set(route) != {"path", "methods"}:
+                raise RuntimeError("Discovery route contains unsupported fields")
+            path = self._canonical_path(route["path"], field="Discovery route path")
+            methods = route["methods"]
+            if (
+                not isinstance(methods, list)
+                or not methods
+                or any(
+                    not isinstance(method, str)
+                    or method not in self._SUPPORTED_METHODS
+                    for method in methods
+                )
+                or len(set(methods)) != len(methods)
+            ):
+                raise RuntimeError("Discovery route methods are invalid")
+            if path in seen_paths:
+                raise RuntimeError("Discovery document contains duplicate routes")
+            seen_paths.add(path)
+            validated.append({"path": path, "methods": methods})
+        return validated
+
+    @staticmethod
+    def _discovery_url(base_url: str, discovery_path: str) -> str:
+        parsed = urlsplit(base_url)
+        if (
+            parsed.scheme != "https"
+            or not parsed.hostname
+            or parsed.username
+            or parsed.password
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise RuntimeError("Discovery and proxy origins must use HTTPS")
+        base_path = parsed.path.rstrip("/")
+        path = base_path + ("" if discovery_path == "/" else discovery_path)
+        return urlunsplit((parsed.scheme, parsed.netloc, path or "/", "", ""))
+
+    def _verify_discovery(
+        self, raw: bytes, timestamp: str, signature: str, secret
+    ) -> list:
+        if (
+            not isinstance(timestamp, str)
+            or not timestamp.isascii()
+            or not timestamp.isdigit()
+        ):
+            raise RuntimeError("Discovery timestamp is invalid")
+        timestamp_value = int(timestamp)
+        max_age = self.get_service_config("DISCOVERY_MAX_AGE_SECONDS", 300)
+        now = int(time.time())
+        if timestamp_value > now + 30 or now - timestamp_value > max_age:
+            raise RuntimeError("Discovery document is stale")
+        if not isinstance(secret, (str, bytes)) or not secret:
+            raise RuntimeError("Discovery HMAC key is required")
+        secret_bytes = secret.encode("utf-8") if isinstance(secret, str) else secret
+        expected = hmac.new(
+            secret_bytes, timestamp.encode("ascii") + b"\n" + raw, hashlib.sha256
+        ).hexdigest()
+        supplied = (
+            signature[3:]
+            if isinstance(signature, str) and signature.startswith("v1=")
+            else ""
+        )
+        if not hmac.compare_digest(expected, supplied):
+            raise RuntimeError("Discovery signature is invalid")
+        return self._validate_document(raw)
+
+    def _read_discovery_body(self, response, started_at: float) -> bytes:
+        if response.headers.get("Content-Encoding", "identity").lower() not in {
+            "",
+            "identity",
+        }:
+            raise RuntimeError("Encoded discovery documents are not accepted")
+        maximum = self.get_service_config("DISCOVERY_MAX_BYTES", 262_144)
+        declared = response.headers.get("Content-Length")
+        if declared is not None:
+            try:
+                if int(declared) > maximum:
+                    raise RuntimeError("Discovery document exceeds byte limit")
+            except ValueError as error:
+                raise RuntimeError("Discovery Content-Length is invalid") from error
+        total_deadline = self.get_service_config(
+            "DISCOVERY_TOTAL_TIMEOUT_SECONDS", 10
+        )
+        chunks = []
+        total = 0
+        for chunk in response.iter_content(chunk_size=min(65536, maximum + 1)):
+            if time.monotonic() - started_at > total_deadline:
+                raise RuntimeError("Discovery total deadline exceeded")
+            total += len(chunk)
+            if total > maximum:
+                raise RuntimeError("Discovery document exceeds byte limit")
+            chunks.append(chunk)
+        return b"".join(chunks)
+
+    def register_services(self):
+        services = self.get_service_config("WEBSERVICES", {})
+        if not isinstance(services, dict):
+            raise RuntimeError("PROXY_SERVICE_WEBSERVICES must be a mapping")
+        for service_name, service in services.items():
+            self.register_service(service_name, service)
+
+    def register_service(self, service_name: str, service: dict):
+        if not isinstance(service_name, str) or not service_name:
+            raise RuntimeError("Proxy service names must be nonempty strings")
+        if not isinstance(service, dict):
+            raise RuntimeError("Proxy service configuration must be a mapping")
+        required = {"base_url", "deploy_path", "discovery_hmac_key", "policy"}
+        allowed = required | {
+            "discovery_path",
+            "discovery_cache",
+            "tls_ca_bundle",
+        }
+        if not required.issubset(service) or not set(service).issubset(allowed):
+            raise RuntimeError("Proxy service configuration has missing or unknown fields")
+
+        deploy_path = self._canonical_path(service["deploy_path"], field="Deploy path")
+        if deploy_path == "/" or "/" in deploy_path[1:]:
+            raise RuntimeError(
+                "Proxy services require a dedicated non-root top-level prefix"
             )
-            properties.setdefault("scopes", self.get_service_config("DEFAULT_SCOPES", []))
-            properties.setdefault("authorization", True)
-            properties.setdefault("cache", None)
-
-            # Create the view
-            rule_name = local_path = (
+        discovery_path = self._canonical_path(
+            service.get("discovery_path", "/resources"), field="Discovery path"
+        )
+        base_url = service["base_url"]
+        parsed_base = urlsplit(base_url)
+        self._canonical_path(
+            parsed_base.path.rstrip("/") or "/", field="Proxy origin base path"
+        )
+        discovery_url = self._discovery_url(base_url, discovery_path)
+        routes = self._fetch_resource_document(
+            service_name, discovery_url, service
+        )
+        policy = service["policy"]
+        if not isinstance(policy, dict) or set(policy) - {"default", "routes"}:
+            raise RuntimeError("Proxy local policy is invalid")
+        default_policy = policy.get("default", {})
+        route_policies = policy.get("routes", {})
+        if not isinstance(default_policy, dict) or not isinstance(route_policies, dict):
+            raise RuntimeError("Proxy local policy is invalid")
+        discovered_paths = {route["path"] for route in routes}
+        for policy_path in route_policies:
+            canonical_policy_path = self._canonical_path(
+                policy_path, field="Proxy policy route path"
+            )
+            if canonical_policy_path not in discovered_paths:
+                raise RuntimeError("Proxy policy contains an undiscovered route")
+        seen_endpoints = set()
+        for route in routes:
+            remote_path = route["path"]
+            local_path = (
                 deploy_path
                 if remote_path == "/"
-                else os.path.join(deploy_path, remote_path.rstrip("/")[1:])
+                else deploy_path.rstrip("/") + remote_path
             )
-            proxy_view = ProxyView.as_view(rule_name, deploy_path, base_url)
+            prefix = deploy_path.rstrip("/") + "/"
+            if local_path != deploy_path and not local_path.startswith(prefix):
+                raise RuntimeError("Discovered route escapes its deployment prefix")
+            endpoint = f"proxy:{service_name}:{remote_path}"
+            if endpoint in seen_endpoints or endpoint in self._app.view_functions:
+                raise RuntimeError("Duplicate proxy endpoint")
+            if self._route_collides(local_path, route["methods"]):
+                raise RuntimeError("Proxy route collides with an existing route")
+            seen_endpoints.add(endpoint)
 
-            if csrf_exempt:
+            local = dict(default_policy)
+            override = route_policies.get(remote_path, {})
+            if not isinstance(override, dict):
+                raise RuntimeError("Proxy route policy must be a mapping")
+            local.update(override)
+            properties = self._validate_local_policy(local, route["methods"])
+            cache_policy = properties["cache"]
+            proxy_view = ProxyView.as_view(
+                endpoint,
+                deploy_path,
+                base_url,
+                remote_path,
+                properties["methods"],
+                properties["authorization"],
+                cache_policy is not None,
+                service.get("tls_ca_bundle"),
+            )
+            if properties["csrf_exempt"]:
                 extensions.csrf.exempt(proxy_view)
-
-            # If configured by the webservice, decorate view with the cache service
-            if properties["cache"] is not None:
-                cache = properties["cache"]
+            if cache_policy is not None:
                 proxy_view = extensions.cache_service.cached(
-                    timeout=cache.get("timeout", 60000),
-                    include_query_parameters=cache.get("query_parameters", True),
-                    excluded_parameters=cache.get("excluded_parameters", []),
+                    timeout=cache_policy["ttl_seconds"],
+                    namespace=f"{service_name}:{local_path}",
+                    query_policy=cache_policy["query_parameters"],
+                    representation_policy=cache_policy["representation_headers"],
+                    max_object_bytes=self.get_service_config(
+                        "MAX_CACHE_OBJECT_BYTES", 1024 * 1024
+                    ),
                 )(proxy_view)
-
-            # Decorate view with the rate limiter service
-            counts = properties["rate_limit"][0]
-            per_second = properties["rate_limit"][1]
+            counts, per_second = properties["rate_limit"]
             proxy_view = extensions.limiter_service.shared_limit(
-                counts=counts,
-                per_second=per_second,
+                counts=counts, per_second=per_second
             )(proxy_view)
-
-            extensions.limiter_service.group_endpoint(local_path, counts, per_second)
-
-            # Decorate view with the auth service, unless explicitly disabled
+            extensions.limiter_service.group_endpoint(
+                local_path, counts, per_second
+            )
             if properties["authorization"]:
-                proxy_view = extensions.auth_service.require_oauth(properties["scopes"])(
-                    proxy_view
-                )
-
-            # Register the view with Flask
+                proxy_view = extensions.auth_service.require_oauth(
+                    properties["scopes"]
+                )(proxy_view)
             self._app.add_url_rule(
-                rule_name,
-                endpoint=local_path,
+                local_path,
+                endpoint=endpoint,
                 view_func=proxy_view,
                 methods=properties["methods"],
-                provide_automatic_options=True,
+                provide_automatic_options=False,
             )
 
-    def _fetch_resource_document(self, base_url: str) -> dict:
-        """
-        Fetches the resource document for a given base URL.
+    def _route_collides(self, local_path: str, methods: list) -> bool:
+        matcher = self._app.url_map.bind("")
+        checked_methods = set(methods)
+        if "GET" in checked_methods:
+            checked_methods.add("HEAD")
+        for method in checked_methods:
+            try:
+                matcher.match(local_path, method=method)
+            except RequestRedirect:
+                return True
+            except (NotFound, MethodNotAllowed):
+                continue
+            return True
+        return False
 
-        Args:
-            base_url (str): The base URL of the service.
+    def _validate_local_policy(self, policy, discovered_methods):
+        allowed = {
+            "methods",
+            "authorization",
+            "scopes",
+            "csrf_exempt",
+            "rate_limit",
+            "cache",
+        }
+        if not isinstance(policy, dict) or set(policy) - allowed:
+            raise RuntimeError("Proxy local policy contains unsupported fields")
+        methods = policy.get("methods", ["GET", "HEAD"])
+        authorization = policy.get("authorization", True)
+        scopes = policy.get("scopes", [])
+        csrf_exempt = policy.get("csrf_exempt", False)
+        rate_limit = policy.get(
+            "rate_limit", self.get_service_config("DEFAULT_RATE_LIMIT", [1000, 86400])
+        )
+        cache = policy.get("cache")
+        if (
+            not isinstance(methods, list)
+            or not methods
+            or any(
+                not isinstance(method, str)
+                or method not in self._SUPPORTED_METHODS
+                for method in methods
+            )
+            or len(set(methods)) != len(methods)
+            or not set(discovered_methods).issubset(methods)
+            or type(authorization) is not bool
+            or type(csrf_exempt) is not bool
+            or not isinstance(scopes, list)
+            or any(not isinstance(scope, str) or not scope for scope in scopes)
+            or not isinstance(rate_limit, list)
+            or len(rate_limit) != 2
+            or any(type(value) is not int or value <= 0 for value in rate_limit)
+        ):
+            raise RuntimeError("Proxy local policy is invalid")
+        methods = list(discovered_methods)
+        if cache is not None:
+            cache = self._validate_cache_policy(cache, authorization, methods)
+        return {
+            "methods": methods,
+            "authorization": authorization,
+            "scopes": scopes,
+            "csrf_exempt": csrf_exempt,
+            "rate_limit": rate_limit,
+            "cache": cache,
+        }
 
-        Returns:
-            A dictionary containing the resource document.
-        """
+    def _validate_cache_policy(self, cache, authorization, methods):
+        if (
+            authorization
+            or methods != ["GET"]
+            or not isinstance(cache, dict)
+            or set(cache)
+            != {"ttl_seconds", "query_parameters", "representation_headers"}
+            or type(cache["ttl_seconds"]) is not int
+            or not 1 <= cache["ttl_seconds"] <= 300
+            or not isinstance(cache["query_parameters"], dict)
+            or not isinstance(cache["representation_headers"], dict)
+        ):
+            raise RuntimeError("Only bounded public GET cache policy is accepted")
 
-        resource_url = urljoin(base_url, self.get_service_config("RESOURCE_ENDPOINT", "/"))
+        query_policy = cache["query_parameters"]
+        max_parameters = self.get_service_config("MAX_CACHE_QUERY_PARAMETERS", 8)
+        max_query_bytes = self.get_service_config("MAX_CACHE_QUERY_VALUE_BYTES", 128)
+        max_query_values = self.get_service_config("MAX_CACHE_QUERY_VALUES", 32)
+        if len(query_policy) > max_parameters:
+            raise RuntimeError("Proxy cache query grammar has too many parameters")
+        normalized_query = {}
+        for name, values in query_policy.items():
+            if (
+                not isinstance(name, str)
+                or not name
+                or len(name.encode("utf-8")) > 64
+                or not isinstance(values, list)
+                or not values
+                or len(values) > max_query_values
+                or any(
+                    not isinstance(value, str)
+                    or len(value.encode("utf-8")) > max_query_bytes
+                    for value in values
+                )
+                or len(set(values)) != len(values)
+            ):
+                raise RuntimeError("Proxy cache query grammar is invalid")
+            normalized_query[name] = sorted(values)
 
+        representation_policy = cache["representation_headers"]
+        forwarded_headers = {
+            header.lower()
+            for header in self.get_service_config(
+                "REQUEST_HEADERS",
+                ["Accept", "Accept-Language", "Content-Type"],
+            )
+        }
+        max_header_values = self.get_service_config(
+            "MAX_CACHE_HEADER_VALUES", 16
+        )
+        max_header_bytes = self.get_service_config(
+            "MAX_CACHE_HEADER_VALUE_BYTES", 256
+        )
+        normalized_headers = {}
+        for name, values in representation_policy.items():
+            if not isinstance(name, str) or not isinstance(values, list):
+                raise RuntimeError("Proxy cache representation grammar is invalid")
+            normalized_name = name.strip().lower()
+            normalized_values = [
+                value if isinstance(value, str) else None
+                for value in values
+            ]
+            if (
+                not normalized_name
+                or normalized_name in normalized_headers
+                or len(values) > max_header_values
+                or any(
+                    not value
+                    or len(value.encode("utf-8")) > max_header_bytes
+                    for value in normalized_values
+                )
+                or len(set(normalized_values)) != len(normalized_values)
+            ):
+                raise RuntimeError("Proxy cache representation grammar is invalid")
+            normalized_headers[normalized_name] = sorted(normalized_values)
+        if set(normalized_headers) != forwarded_headers:
+            raise RuntimeError(
+                "Proxy cache must declare finite values for every forwarded header"
+            )
+        return {
+            "ttl_seconds": cache["ttl_seconds"],
+            "query_parameters": normalized_query,
+            "representation_headers": normalized_headers,
+        }
+
+
+    def _fetch_resource_document(self, service_name, resource_url, service):
+        cache_key = f"proxy-discovery:{service_name}"
+        verify = service.get(
+            "tls_ca_bundle", self.get_service_config("TLS_CA_BUNDLE", True)
+        )
+        if not (verify is True or isinstance(verify, str) and bool(verify)):
+            raise RuntimeError(
+                "Discovery TLS verification requires system trust or a CA bundle path"
+            )
         try:
-            timeout = self.get_service_config("RESOURCE_TIMEOUT", 5)
-            response = requests.get(resource_url, timeout=timeout)
-            response.raise_for_status()
-
-            extensions.storage_service.set(resource_url, response.json())
-            return response.json()
-        except requests.exceptions.RequestException as ex:
-            if extensions.storage_service.has(resource_url):
-                self._logger.info("Using cached resource document for %s", resource_url)
-                return extensions.storage_service.get(resource_url)
-            else:
-                raise ex
+            total_deadline = self.get_service_config(
+                "DISCOVERY_TOTAL_TIMEOUT_SECONDS", 10
+            )
+            started_at = time.monotonic()
+            response = requests.get(
+                resource_url,
+                headers={"Accept": "application/json", "Accept-Encoding": "identity"},
+                timeout=(
+                    min(
+                        self.get_service_config(
+                            "DISCOVERY_CONNECT_TIMEOUT_SECONDS", 3
+                        ),
+                        total_deadline,
+                    ),
+                    min(
+                        self.get_service_config("DISCOVERY_READ_TIMEOUT_SECONDS", 5),
+                        total_deadline,
+                    ),
+                ),
+                allow_redirects=False,
+                stream=True,
+                verify=verify,
+            )
+            try:
+                response.raise_for_status()
+                if response.status_code != 200:
+                    raise RuntimeError("Discovery response status must be 200")
+                raw = self._read_discovery_body(response, started_at)
+                timestamp = response.headers.get("X-Discovery-Timestamp")
+                signature = response.headers.get("X-Discovery-Signature")
+                routes = self._verify_discovery(
+                    raw, timestamp, signature, service["discovery_hmac_key"]
+                )
+            finally:
+                response.close()
+            if service.get("discovery_cache", False):
+                extensions.storage_service.set(
+                    cache_key,
+                    {
+                        "body": raw.decode("utf-8"),
+                        "timestamp": timestamp,
+                        "signature": signature,
+                    },
+                    timeout=self.get_service_config(
+                        "DISCOVERY_MAX_AGE_SECONDS", 300
+                    ),
+                )
+            return routes
+        except (requests.exceptions.RequestException, RuntimeError):
+            if not service.get("discovery_cache", False):
+                raise
+            cached = extensions.storage_service.get(cache_key)
+            if not isinstance(cached, dict) or set(cached) != {
+                "body",
+                "timestamp",
+                "signature",
+            }:
+                raise RuntimeError("No authenticated fresh discovery cache is available")
+            return self._verify_discovery(
+                cached["body"].encode("utf-8"),
+                cached["timestamp"],
+                cached["signature"],
+                service["discovery_hmac_key"],
+            )
 
 
 class LimiterService(GatewayService, Limiter):
@@ -1033,7 +1433,7 @@ class StorageService(GatewayService):
 
 
 class CacheService(GatewayService, Cache):
-    """A service class that provides caching functionality for the API Gateway."""
+    """Cache only complete anonymous public GET representations."""
 
     def __init__(self, name: str = "CACHE_SERVICE"):
         GatewayService.__init__(self, name)
@@ -1041,112 +1441,367 @@ class CacheService(GatewayService, Cache):
 
     def init_app(self, app: Flask):
         GatewayService.init_app(self, app)
-
         app.config.setdefault("CACHE_REDIS_URL", self.get_service_config("REDIS_URI"))
-        app.config.setdefault("CACHE_TYPE", self.get_service_config("CACHE_TYPE", "RedisCache"))
-
+        app.config.setdefault(
+            "CACHE_TYPE", self.get_service_config("CACHE_TYPE", "RedisCache")
+        )
         Cache.init_app(self, app)
 
-    def clear_cache(self, request_path: str, parameters: dict) -> bool:
-        """Clears the cache for the specified request path and parameters.
+    @staticmethod
+    def _generation_key(request_path: str) -> str:
+        digest = hashlib.sha256(request_path.encode("utf-8")).hexdigest()
+        return f"proxy-cache-generation/{digest}"
 
-        Args:
-            request_path (str): The request path.
-            parameters (dict): The request parameters used to construct the cache key.
-
-        Returns:
-            bool: True if the cache is cleared successfully, False otherwise.
-        """
+    def clear_cache(self, request_path: str) -> bool:
+        """Invalidate all query and representation variants for one route."""
         if request_path == "*":
-            self._logger.info("Clearing all cache")
+            self._logger.info("Clearing all proxy cache entries")
             return self.clear()
+        key = self._generation_key(request_path)
+        incremented = self.cache.inc(key)
+        if incremented is None or incremented is False:
+            if not self.cache.add(key, 1, timeout=0):
+                incremented = self.cache.inc(key)
+        self._logger.info("Invalidated proxy cache route generation")
+        return incremented is not False
 
-        params_tuple = list(parameters.items()) if parameters else []
-        key = self._make_cache_key(request_path, params_tuple)
-        self._logger.info("Clearing cache for key %s", key)
-        return self.delete(key)
+    @staticmethod
+    def _cache_control_directives(value: str) -> dict:
+        directives = {}
+        for token in value.split(","):
+            name, separator, directive_value = token.strip().partition("=")
+            if name:
+                directives[name.lower()] = (
+                    directive_value.strip().strip('"') if separator else None
+                )
+        return directives
+
+    @classmethod
+    def _request_cache_constraints(cls):
+        directives = cls._cache_control_directives(
+            request.headers.get("Cache-Control", "")
+        )
+        if "no-cache" in directives or "no-store" in directives:
+            return None
+        if {
+            token.strip().lower()
+            for token in request.headers.get("Pragma", "").split(",")
+        } & {"no-cache"}:
+            return None
+        if set(directives) - {"max-age", "min-fresh"}:
+            return None
+        constraints = {}
+        for directive in ("max-age", "min-fresh"):
+            if directive not in directives:
+                continue
+            try:
+                value = int(directives[directive])
+            except (TypeError, ValueError):
+                return None
+            if value < 0 or directive == "max-age" and value == 0:
+                return None
+            constraints[directive] = value
+        return constraints
+
+    @classmethod
+    def _normalize_cache_request(cls, query_policy, representation_policy):
+        constraints = cls._request_cache_constraints()
+        if (
+            constraints is None
+            or request.method != "GET"
+            or request.content_length not in {None, 0}
+            or request.environ.get("wsgi.input_terminated", False)
+            or any(
+                request.headers.get(name)
+                for name in (
+                    "Authorization",
+                    "Cookie",
+                    "Proxy-Authorization",
+                    "Range",
+                    "If-Range",
+                    "X-api-uid",
+                    "X-Access-Modality",
+                )
+            )
+        ):
+            return None
+
+        query_pairs = []
+        if set(request.args) - set(query_policy):
+            return None
+        for name in sorted(request.args):
+            values = request.args.getlist(name)
+            if len(values) != 1 or values[0] not in query_policy[name]:
+                return None
+            query_pairs.append((name, values[0]))
+        if request.query_string != urlencode(query_pairs).encode("ascii"):
+            return None
+
+        connection_tokens = {
+            token.strip().lower()
+            for token in request.headers.get("Connection", "").split(",")
+            if token.strip()
+        }
+        if connection_tokens.intersection(representation_policy):
+            return None
+
+        header_values = []
+        for name in sorted(representation_policy):
+            values = request.headers.getlist(name)
+            if len(values) > 1:
+                return None
+            value = values[0] if values else None
+            if value is not None and value not in representation_policy[name]:
+                return None
+            header_values.append((name, value))
+        return query_pairs, header_values, constraints
+
+    @classmethod
+    def _cache_response_eligible(
+        cls, response: Response, representation_policy
+    ) -> bool:
+        cache_control = cls._cache_control_directives(
+            response.headers.get("Cache-Control", "")
+        )
+        vary = {
+            token.strip().lower()
+            for token in response.headers.get("Vary", "").split(",")
+            if token.strip()
+        }
+        return (
+            not getattr(response, "_proxy_cache_forbidden", False)
+            and response.status_code == 200
+            and not response.is_streamed
+            and "Set-Cookie" not in response.headers
+            and "Content-Range" not in response.headers
+            and "private" not in cache_control
+            and "no-store" not in cache_control
+            and "no-cache" not in cache_control
+            and "*" not in vary
+            and vary.issubset(set(representation_policy))
+        )
+
+    @classmethod
+    def _cache_response_freshness(
+        cls,
+        response: Response,
+        configured_timeout: int,
+        now: float,
+        response_delay: float = 0,
+    ):
+        directives = cls._cache_control_directives(
+            response.headers.get("Cache-Control", "")
+        )
+        try:
+            age_value = int(response.headers.get("Age", "0"))
+        except (TypeError, ValueError):
+            return None
+        if age_value < 0:
+            return None
+
+        date_value = None
+        if "Date" in response.headers:
+            try:
+                parsed_date = parsedate_to_datetime(response.headers["Date"])
+            except (TypeError, ValueError, OverflowError):
+                return None
+            if parsed_date is None:
+                return None
+            if parsed_date.tzinfo is None:
+                parsed_date = parsed_date.replace(tzinfo=timezone.utc)
+            date_value = parsed_date.timestamp()
+        apparent_age = max(0, now - date_value) if date_value is not None else 0
+        corrected_age_value = float(age_value) + max(0, response_delay)
+        initial_age = max(corrected_age_value, apparent_age)
+
+        lifetimes = {}
+        for directive in ("s-maxage", "max-age"):
+            if directive not in directives:
+                continue
+            try:
+                lifetimes[directive] = int(directives[directive])
+            except (TypeError, ValueError):
+                return None
+            if lifetimes[directive] <= 0:
+                return None
+        origin_lifetime = lifetimes.get(
+            "s-maxage", lifetimes.get("max-age")
+        )
+        if origin_lifetime is None and "Expires" in response.headers:
+            try:
+                expires_at = parsedate_to_datetime(response.headers["Expires"])
+            except (TypeError, ValueError, OverflowError):
+                return None
+            if expires_at is None:
+                return None
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+            if date_value is not None:
+                origin_lifetime = expires_at.timestamp() - date_value
+            else:
+                origin_lifetime = initial_age + expires_at.timestamp() - now
+        freshness_lifetime = float(configured_timeout)
+        if origin_lifetime is not None:
+            freshness_lifetime = min(
+                freshness_lifetime, float(origin_lifetime)
+            )
+        remaining = freshness_lifetime - initial_age
+        if remaining <= 0:
+            return None
+        return initial_age, freshness_lifetime, remaining
+
+    @classmethod
+    def _cache_response_timeout(
+        cls, response: Response, configured_timeout: int, now: float = None
+    ):
+        freshness = cls._cache_response_freshness(
+            response,
+            configured_timeout,
+            time.time() if now is None else now,
+        )
+        return None if freshness is None else max(1, math.ceil(freshness[2]))
+
+    @staticmethod
+    def _cached_response_is_fresh(
+        initial_age, freshness_lifetime, stored_at, constraints, now
+    ):
+        current_age = initial_age + max(0, now - stored_at)
+        if current_age >= freshness_lifetime:
+            return None
+        if (
+            "max-age" in constraints
+            and current_age > constraints["max-age"]
+        ):
+            return None
+        if (
+            "min-fresh" in constraints
+            and current_age + constraints["min-fresh"] >= freshness_lifetime
+        ):
+            return None
+        return current_age
 
     def cached(
         self,
-        timeout: int = None,
-        unless: int = None,
-        forced_update: int = None,
-        response_filter: int = None,
-        include_query_parameters: bool = True,
-        excluded_parameters: list = [],
+        timeout: int,
+        namespace: str,
+        query_policy: dict,
+        representation_policy: dict,
+        max_object_bytes: int = 1024 * 1024,
     ) -> Callable:
-        """
-        Decorator that caches the response of a function/method.
+        if type(timeout) is not int or not 1 <= timeout <= 300:
+            raise RuntimeError("Proxy cache TTL must be between 1 and 300 seconds")
+        if not isinstance(query_policy, dict) or not isinstance(
+            representation_policy, dict
+        ):
+            raise RuntimeError("Proxy cache grammar is invalid")
+        if type(max_object_bytes) is not int or max_object_bytes <= 0:
+            raise RuntimeError("Proxy cache object limit must be a positive integer")
 
-        Args:
-            timeout (int, optional): The cache timeout in seconds. Defaults to None.
-            unless (int, optional): The cache will not be used if the function/method returns a value equal to this parameter. Defaults to None.
-            forced_update (int, optional): The cache will be forcibly updated if the function/method returns a value equal to this parameter. Defaults to None.
-            response_filter (int, optional): The cache will be filtered using this parameter. Defaults to None.
-            include_query_parameters (bool, optional): Determines whether to include query parameters in the cache key. Defaults to True.
-            excluded_parameters (list, optional): List of parameters to exclude from the cache key. Defaults to [].
+        def decorator(function):
+            @wraps(function)
+            def wrapped(*args, **kwargs):
+                normalized = self._normalize_cache_request(
+                    query_policy, representation_policy
+                )
+                if normalized is None:
+                    return function(*args, **kwargs)
+                query_pairs, header_values, constraints = normalized
+                key = self._make_cache_key(
+                    namespace, query_pairs, header_values
+                )
+                cached_response = self.get(key)
+                now = time.time()
+                if (
+                    isinstance(cached_response, tuple)
+                    and len(cached_response) == 7
+                    and cached_response[0] == "proxy-cache-v2"
+                ):
+                    (
+                        _,
+                        body,
+                        status,
+                        headers,
+                        stored_at,
+                        initial_age,
+                        freshness_lifetime,
+                    ) = cached_response
+                    current_age = self._cached_response_is_fresh(
+                        initial_age,
+                        freshness_lifetime,
+                        stored_at,
+                        constraints,
+                        now,
+                    )
+                    if current_age is not None:
+                        response = Response(body, status=status, headers=headers)
+                        response.headers["Age"] = str(int(current_age))
+                        return response
+                    absolute_age = initial_age + max(0, now - stored_at)
+                    if absolute_age >= freshness_lifetime:
+                        self.delete(key)
 
-        Returns:
-            Callable: The decorated function/method.
-        """
-        return Cache.cached(
-            self,
-            timeout=timeout,
-            unless=unless,
-            forced_update=forced_update,
-            response_filter=response_filter,
-            make_cache_key=lambda *args, **kwargs: self._make_cache_key_from_request(
-                include_query_parameters, excluded_parameters
-            ),
-        )
+                request_time = now
+                g.proxy_cache_capture = max_object_bytes
+                try:
+                    response = current_app.make_response(function(*args, **kwargs))
+                finally:
+                    g.pop("proxy_cache_capture", None)
+                if self._cache_response_eligible(
+                    response, representation_policy
+                ):
+                    stored_at = time.time()
+                    freshness = self._cache_response_freshness(
+                        response,
+                        timeout,
+                        stored_at,
+                        response_delay=stored_at - request_time,
+                    )
+                    body = response.get_data()
+                    headers = list(response.headers.items())
+                    object_bytes = len(body) + sum(
+                        len(str(name).encode("utf-8"))
+                        + len(str(value).encode("utf-8"))
+                        for name, value in headers
+                    )
+                    if freshness is not None and object_bytes <= max_object_bytes:
+                        initial_age, freshness_lifetime, remaining = freshness
+                        self.set(
+                            key,
+                            (
+                                "proxy-cache-v2",
+                                body,
+                                response.status_code,
+                                headers,
+                                stored_at,
+                                initial_age,
+                                freshness_lifetime,
+                            ),
+                            timeout=max(1, math.ceil(remaining)),
+                        )
+                return response
 
-    def _make_cache_key_from_request(
-        self, include_query_parameters: bool, excluded_parameters: list
-    ) -> str:
-        """
-        Generate a cache key based on the request.
+            return wrapped
 
-        Args:
-            include_query_parameters (bool): Flag indicating whether to include query parameters in the cache key.
-            excluded_parameters (list): List of query parameters to exclude from the cache key.
-
-        Returns:
-            str: The generated cache key.
-        """
-        request_params = []
-        if include_query_parameters:
-            request_params = sorted(
-                (k, v) for (k, v) in request.args.items(multi=True) if k not in excluded_parameters
-            )
-
-        return self._make_cache_key(request.path, request_params)
+        return decorator
 
     def _make_cache_key(
-        self,
-        request_path: str,
-        request_params: list[tuple[str, str]] = None,
-        hash_method: Callable = hashlib.md5,
+        self, namespace: str, query_pairs: list, header_values: list
     ) -> str:
-        """Generate a cache key for the given request.
-
-        Args:
-            request_path (str): The path of the request.
-            request_params (list[tuple[str, str]], optional): The parameters of the request. Defaults to None.
-            hash_method (Callable, optional): The hash method to use. Defaults to hashlib.md5.
-
-        Returns:
-            str: The generated cache key.
-        """
-        cache_key = "view/%s" % request_path
-
-        if request_params:
-            args_as_bytes = str(request_params).encode()
-            cache_arg_hash = hash_method(args_as_bytes)
-            cache_arg_hash = str(cache_arg_hash.hexdigest())
-
-            cache_key += "/{}".format(cache_arg_hash)
-
-        return cache_key
+        generation = self.get(self._generation_key(request.path)) or 0
+        material = json.dumps(
+            [
+                "proxy-cache-v2",
+                namespace,
+                request.method,
+                request.path,
+                query_pairs,
+                header_values,
+                generation,
+            ],
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return "proxy-view/" + hashlib.sha256(material).hexdigest()
 
 
 class SecurityService(GatewayService, Security):

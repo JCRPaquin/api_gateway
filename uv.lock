@@ -101,9 +101,11 @@ dependencies = [
     { name = "portalocker" },
     { name = "psycopg2-binary" },
     { name = "redis" },
+    { name = "requests" },
     { name = "setuptools" },
     { name = "sqlalchemy-citext" },
     { name = "sqlalchemy-utils" },
+    { name = "urllib3" },
 ]
 
 [package.optional-dependencies]
@@ -154,9 +156,11 @@ requires-dist = [
     { name = "pytest-mock", marker = "extra == 'dev'", specifier = "==3.15.1" },
     { name = "pyupgrade", marker = "extra == 'dev'", specifier = "==3.21.2" },
     { name = "redis", specifier = "==5.0.1" },
+    { name = "requests", specifier = "==2.34.2" },
     { name = "setuptools", specifier = "==80.9.0" },
     { name = "sqlalchemy-citext", specifier = "==1.8.0" },
     { name = "sqlalchemy-utils", specifier = "==0.41.1" },
+    { name = "urllib3", specifier = "==2.8.0" },
 ]
 provides-extras = ["dev"]
 
