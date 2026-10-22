@@ -1,3 +1,5 @@
-{% for key, value in data.items() -%}
-    **{{ key }}**  {{ value }}
-{% endfor %}
+From: {{data.name}}
+Address: {{data['_replyto']}}
+
+Comments:
+{{data.comments}}

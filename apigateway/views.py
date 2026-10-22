@@ -1,23 +1,21 @@
 import binascii
 import hashlib
 import json
-import os
-from copy import copy
 from datetime import datetime
-from urllib.parse import unquote
 
-import requests
 from authlib.integrations.flask_oauth2 import current_token
 from flask import current_app, render_template, request, session
 from flask.sessions import SecureCookieSessionInterface
 from flask_login import current_user, login_required, login_user, logout_user
 from flask_restful import Resource, abort
 from flask_wtf.csrf import generate_csrf
+from marshmallow import ValidationError
 from sqlalchemy import or_
 from werkzeug.security import gen_salt
 
 from apigateway import email_templates as templates
 from apigateway import exceptions, extensions, schemas
+from apigateway.domains import canonicalize_email
 from apigateway.models import (
     EmailChangeRequest,
     OAuth2Client,
@@ -25,20 +23,33 @@ from apigateway.models import (
     PasswordChangeRequest,
     User,
 )
+from apigateway.notifications import (
+    ACCOUNT_ACCEPTED_MESSAGE,
+    enqueue_account_request,
+    enqueue_feedback_notifications,
+    enqueue_notification,
+    enqueue_template_email,
+    request_environment,
+)
 from apigateway.utils import (
+    DeliveryState,
     generate_complete_blocklist,
     get_json_body,
-    get_request_site_settings,
     make_json_diff,
-    normalize_email_domain,
     require_non_anonymous_bootstrap_user,
-    send_account_registration_attempt_email,
-    send_email,
-    send_feedback_email,
-    send_password_reset_email,
-    send_welcome_email,
     verify_recaptcha,
 )
+from werkzeug.exceptions import RequestEntityTooLarge
+
+def _account_body():
+    return get_json_body(
+        request, max_bytes=current_app.config.get("ACCOUNT_MAX_REQUEST_BYTES", 16_384)
+    )
+
+
+def _queue_unavailable_response():
+    return {"message": "Notification service unavailable"}, 503, {"Retry-After": "60"}
+
 
 
 class BootstrapView(Resource):
@@ -46,7 +57,7 @@ class BootstrapView(Resource):
     decorators = [extensions.auth_service.require_oauth(optional=True)]
 
     def get(self):
-        params = schemas.bootstrap_request.load(get_json_body(request))
+        params = schemas.bootstrap_request.load(_account_body())
 
         if not current_user.is_authenticated:
             bootstrap_user: User = User.query.filter_by(is_anonymous_bootstrap_user=True).first()
@@ -117,9 +128,15 @@ class UserAuthView(Resource):
     decorators = [extensions.limiter_service.shared_limit("30/120 second")]
 
     def post(self):
-        params = schemas.user_auth_request.load(get_json_body(request))
+        params = schemas.user_auth_request.load(_account_body())
+        canonical_email = canonicalize_email(params.email)
         with current_app.session_scope() as session:
-            user: User = session.query(User).filter_by(email=params.email).first()
+            user: User = (
+                session.query(User)
+                .filter_by(email=canonical_email)
+                .with_for_update()
+                .first()
+            )
 
             if not user or not user.validate_password(params.password):
                 abort(401, message="Invalid username or password")
@@ -130,12 +147,23 @@ class UserAuthView(Resource):
                 schemas.PasswordValidator()(params.password)
             except:  # noqa
                 current_app.logger.info(
-                    "Forcing generation of password reset token for user: {}".format(user.id)
+                    "Forcing creation of password reset action for user: %s", user.id
                 )
-                token: str = extensions.security_service.generate_password_token(user.id)
                 self._delete_existing_password_change_requests(session, user.id)
-                self._create_password_change_request(session, token, user.id)
-                send_password_reset_email(token, user.email)
+                action = self._create_password_change_request(session, user.id)
+                session.flush()
+                environment = request_environment(request.headers.get("Host", ""))
+                outcome = enqueue_notification(
+                    "password_reset_action",
+                    {"action_id": action.delivery_id, **environment},
+                    dedupe_key=f"password-reset-delivery:{action.delivery_id}",
+                    session=session,
+                    commit=False,
+                )
+                if outcome.state != DeliveryState.QUEUED:
+                    session.rollback()
+                    return _queue_unavailable_response()
+                session.commit()
 
                 current_app.logger.info("Forcing password reset for user {}".format(user.email))
 
@@ -143,7 +171,7 @@ class UserAuthView(Resource):
                     422,
                     message=(
                         "Your password does not meet the new requirements. "
-                        "An email has been sent to you with instructions on how to reset your password."
+                        "A password-reset email delivery request has been accepted."
                     ),
                 )
 
@@ -164,11 +192,10 @@ class UserAuthView(Resource):
             PasswordChangeRequest.user_id == user_id
         ).delete()
 
-    def _create_password_change_request(self, session, token: str, user_id: int):
-        password_change_request = PasswordChangeRequest(token=token, user_id=user_id)
-
+    def _create_password_change_request(self, session, user_id: int):
+        password_change_request = PasswordChangeRequest(user_id=user_id)
         session.add(password_change_request)
-        session.commit()
+        return password_change_request
 
 
 class CSRFView(Resource):
@@ -213,41 +240,64 @@ class UserManagementView(Resource):
     complete_blocklist = generate_complete_blocklist()
 
     def post(self):
-        params = schemas.user_register_request.load(get_json_body(request))
-
-        if not verify_recaptcha(request):
+        params = schemas.user_register_request.load(_account_body())
+        if not verify_recaptcha(params.g_recaptcha_response):
             return {"error": "captcha was not verified"}, 403
 
-        user = User.query.filter_by(email=params.email).first()
-        if user is not None:
-            send_account_registration_attempt_email(params.email)
-            current_app.logger.warning(
-                "Registration attempt for existing user {0}".format(params.email)
-            )
-            return {"message": "success"}, 200
-
         try:
-            if current_app.config.get("BLOCK_DISPOSABLE_EMAIL_DOMAINS", False):
-                email_domain = normalize_email_domain(params.email.rsplit("@", 1)[1])
-                if email_domain in self.complete_blocklist:
-                    current_app.logger.warning("User {} attempting to register with disposable email domain.".format(params.email))
-                    raise ValueError("Invalid email domain: {}. Account registration with disposable email services is not allowed.".format(email_domain))
+            canonical_email = canonicalize_email(params.email)
+        except ValueError as exc:
+            return {"error": str(exc)}, 400
+        domain = canonical_email.rsplit("@", 1)[1]
+        if (
+            current_app.config.get("BLOCK_DISPOSABLE_EMAIL_DOMAINS", False)
+            and domain in self.complete_blocklist
+        ):
+            return {
+                "error": "Account registration with disposable email services is not allowed."
+            }, 400
 
-            user: User = extensions.security_service.create_user(
-                given_name=params.given_name,
-                family_name=params.family_name,
-                email=params.email,
-                password=params.password1,
-                registered_at=datetime.now(),
-                login_count=0,
-            )
-
-            token = extensions.security_service.generate_email_token(user.id)
-            send_welcome_email(token, user.email)
-            current_app.logger.info("Sent Welcome email for user: {}".format(user.email))
-            return {"message": "success"}, 200
-        except ValueError as e:
-            return {"error": str(e)}, 400
+        session = extensions.db.session
+        environment = request_environment(request.headers.get("Host", ""))
+        try:
+            user = session.query(User).filter_by(email=canonical_email).first()
+            if user is None:
+                user = extensions.security_service.create_user(
+                    email=canonical_email,
+                    password=params.password1,
+                    commit=False,
+                    given_name=params.given_name,
+                    family_name=params.family_name,
+                    registered_at=datetime.utcnow(),
+                    login_count=0,
+                )
+                outcome = enqueue_notification(
+                    "welcome_email",
+                    {"user_id": user.id, **environment},
+                    dedupe_key=f"registration:{canonical_email}",
+                    session=session,
+                    commit=False,
+                    replace=True,
+                )
+            else:
+                outcome = enqueue_template_email(
+                    canonical_email,
+                    templates.AccountRegistrationAttemptEmail,
+                    ui_env=environment["ui_env"],
+                    ui_url=environment["ui_url"],
+                    dedupe_key=f"registration:{canonical_email}",
+                    session=session,
+                    commit=False,
+                )
+            if outcome.state != DeliveryState.QUEUED:
+                session.rollback()
+                return _queue_unavailable_response()
+            session.commit()
+        except Exception:
+            session.rollback()
+            current_app.logger.exception("Registration transaction failed")
+            return _queue_unavailable_response()
+        return {"message": ACCOUNT_ACCEPTED_MESSAGE}, 202
 
     @login_required
     @require_non_anonymous_bootstrap_user
@@ -263,7 +313,7 @@ class UserManagementView(Resource):
     @login_required
     @require_non_anonymous_bootstrap_user
     def put(self):
-        params = schemas.update_user_request.load(get_json_body(request))
+        params = schemas.update_user_request.load(_account_body())
 
         with current_app.session_scope() as session:
             user: User = session.query(User).filter_by(fs_uniquifier=current_user.get_id()).first()
@@ -286,7 +336,7 @@ class ChangePasswordView(Resource):
     @login_required
     @require_non_anonymous_bootstrap_user
     def post(self):
-        params = schemas.change_password_request.load(get_json_body(request))
+        params = schemas.change_password_request.load(_account_body())
 
         if not current_user.validate_password(params.old_password):
             return {"error": "please verify your current password"}, 401
@@ -301,63 +351,56 @@ class ResetPasswordView(Resource):
         return {"email": user.email}, 200
 
     def post(self, token_or_email):
-        if not verify_recaptcha(request):
+        params = schemas.captcha_request.load(_account_body())
+        if not verify_recaptcha(params.g_recaptcha_response):
             return {"error": "captcha was not verified"}, 403
-
-        with current_app.session_scope() as session:
-            user: User = session.query(User).filter_by(email=token_or_email).first()
-
-            if user is not None:
-                if user.is_anonymous_bootstrap_user:
-                    return {"error": "cannot reset password for anonymous bootstrap user"}, 403
-
-                if not user.confirmed_at:
-                    return {
-                        "error": "this email was never verified. It will be deleted from out database within a day"
-                    }, 403
-
-                token: str = extensions.security_service.generate_password_token()
-                self._delete_existing_password_change_requests(session, user.id)
-                self._create_password_change_request(session, token, user.id)
-
-                current_app.logger.info(
-                    "Sent password reset email for user: {}".format(token_or_email)
-                )
-                send_password_reset_email(token, token_or_email)
-
-            return {"message": "success"}, 200
+        try:
+            schemas.validate_public_email(token_or_email)
+            canonical_email = canonicalize_email(token_or_email)
+        except (ValueError, ValidationError):
+            return {"message": "Invalid email address"}, 400
+        outcome = enqueue_account_request(
+            "password_reset_request", canonical_email, request.headers.get("Host", "")
+        )
+        if outcome.state != DeliveryState.QUEUED:
+            return _queue_unavailable_response()
+        return {"message": ACCOUNT_ACCEPTED_MESSAGE}, 202
 
     def put(self, token_or_email):
-        params = schemas.reset_password_request.load(get_json_body(request))
+        params = schemas.reset_password_request.load(_account_body())
 
         with current_app.session_scope() as session:
-            password_change_request = (
-                session.query(PasswordChangeRequest).filter_by(token=token_or_email).first()
-            )
+            try:
+                # Resolve the account without taking the action lock, then acquire
+                # locks in the same User -> PasswordChangeRequest order as reset
+                # generation. The second lookup both locks and revalidates the
+                # exact generation named by the bearer.
+                candidate = extensions.security_service.verify_password_action(
+                    token_or_email, session=session
+                )
+                user = (
+                    session.query(User)
+                    .filter_by(id=candidate.user_id)
+                    .with_for_update()
+                    .one()
+                )
+                action = extensions.security_service.verify_password_action(
+                    token_or_email, session=session, for_update=True
+                )
+                if action.user_id != user.id:
+                    raise ValueError("password reset action account changed")
 
-            if password_change_request is None:
-                return {"error": "no user associated with that verification token"}, 404
-
-            user: User = extensions.security_service.change_password(
-                password_change_request.user, params.password1
-            )
-
-            self._delete_existing_password_change_requests(session, user.id)
+                user = extensions.security_service.change_password(
+                    user, params.password1, session=session, commit=False
+                )
+                session.delete(action)
+                session.commit()
+            except Exception:
+                session.rollback()
+                raise
 
             login_user(user)
-
             return {"message": "success"}, 200
-
-    def _delete_existing_password_change_requests(self, session, user_id: int):
-        session.query(PasswordChangeRequest).filter(
-            PasswordChangeRequest.user_id == user_id
-        ).delete()
-
-    def _create_password_change_request(self, session, token: str, user_id: int):
-        password_change_request = PasswordChangeRequest(token=token, user_id=user_id)
-
-        session.add(password_change_request)
-        session.commit()
 
 
 class ChangeEmailView(Resource):
@@ -368,29 +411,58 @@ class ChangeEmailView(Resource):
     ]
 
     def post(self):
-        params = schemas.change_email_request.load(get_json_body(request))
+        params = schemas.change_email_request.load(_account_body())
 
         if not current_user.validate_password(params.password):
             return {"error": "the provided password is incorrect"}, 401
 
-        if not extensions.security_service.validate_email(params.email):
+        try:
+            canonical_email = canonicalize_email(params.email)
+        except ValueError:
+            return {"error": "the provided email address is invalid"}, 400
+        if not extensions.security_service.validate_email(canonical_email):
             return {"error": "the provided email address is invalid"}, 400
 
-        with current_app.session_scope() as session:
-            if self._is_email_registered(session, params.email):
+        session = extensions.db.session
+        try:
+            if self._is_email_registered(session, canonical_email):
                 return {"error": "{0} has already been registered".format(params.email)}, 403
 
             token: str = extensions.security_service.generate_email_token()
-
             self._delete_existing_email_change_requests(session)
-            self._create_email_change_request(session, token, params.email)
-            # Verify new email address
-            self._send_verification_email(token, params.email)
-
-            # Notify previous email address of change
-            self._send_notify_email_change()
-
-            return {"message": "success"}, 200
+            action = self._create_email_change_request(session, token, canonical_email)
+            session.flush()
+            environment = request_environment(request.headers.get("Host", ""))
+            verification_outcome = enqueue_notification(
+                "email_change_verification",
+                {"action_id": action.id, **environment},
+                dedupe_key=f"change-email-verify:{current_user.id}",
+                session=session,
+                commit=False,
+                replace=True,
+            )
+            notification_outcome = enqueue_template_email(
+                current_user.email,
+                templates.EmailChangedNotification,
+                ui_env=environment["ui_env"],
+                ui_url=environment["ui_url"],
+                dedupe_key=f"change-email-notify:{current_user.id}",
+                session=session,
+                commit=False,
+                replace=True,
+            )
+            if any(
+                outcome.state != DeliveryState.QUEUED
+                for outcome in (verification_outcome, notification_outcome)
+            ):
+                session.rollback()
+                return _queue_unavailable_response()
+            session.commit()
+            return {"message": "success"}, 202
+        except Exception:
+            session.rollback()
+            current_app.logger.exception("Email change transaction failed")
+            return _queue_unavailable_response()
 
     def _delete_existing_email_change_requests(self, session):
         session.query(EmailChangeRequest).filter(
@@ -403,36 +475,12 @@ class ChangeEmailView(Resource):
             user_id=current_user.id,
             new_email=new_email,
         )
-
         session.add(email_change_request)
-        session.commit()
+        return email_change_request
 
     def _is_email_registered(self, session, email: str):
         return session.query(User).filter_by(email=email).first() is not None
 
-    def _send_verification_email(self, token, new_email: str):
-        ui_env, ui_url, verify_url = get_request_site_settings()
-        verification_url = f"{verify_url}/change-email/{token}"
-
-
-        send_email(
-            current_app.config["MAIL_DEFAULT_SENDER"],
-            new_email,
-            templates.VerificationEmail,
-            verification_url=verification_url,
-            ui_url=ui_url,
-            ui_env=ui_env,
-        )
-
-    def _send_notify_email_change(self):
-        ui_env, ui_url, _ = get_request_site_settings()
-        send_email(
-            current_app.config["MAIL_DEFAULT_SENDER"],
-            current_user.email,
-            templates.EmailChangedNotification,
-            ui_url=ui_url,
-            ui_env=ui_env,
-        )
 
 
 class VerifyEmailView(Resource):
@@ -456,18 +504,19 @@ class VerifyEmailView(Resource):
             return {"message": "success"}, 200
 
     def put(self, email):
-        with current_app.session_scope() as session:
-            user = session.query(User).filter_by(email=email).first()
-            if user is None:
-                return {"message": "User not found"}, 404
-
-            if user.confirmed_at:
-                return {"message": "User already verified"}, 200
-
-            token = extensions.security_service.generate_email_token(user.id)
-            send_welcome_email(token, email)
-
-            return {"message": "success"}, 200
+        try:
+            schemas.validate_public_email(email)
+            canonical_email = canonicalize_email(email)
+        except (ValueError, ValidationError):
+            return {"message": "Invalid email address"}, 400
+        outcome = enqueue_account_request(
+            "verification_resend_request",
+            canonical_email,
+            request.headers.get("Host", ""),
+        )
+        if outcome.state != DeliveryState.QUEUED:
+            return _queue_unavailable_response()
+        return {"message": ACCOUNT_ACCEPTED_MESSAGE}, 202
 
 
 class ChacheManagementView(Resource):
@@ -681,9 +730,7 @@ class UserInfoView(Resource):
 
 
 class UserFeedbackView(Resource):
-    """
-    Forwards a user's feedback to Slack and/or email
-    """
+    """Validate, bound, and enqueue public feedback notifications."""
 
     decorators = [
         extensions.limiter_service.shared_limit("500/600 second"),
@@ -691,192 +738,141 @@ class UserFeedbackView(Resource):
     ]
 
     def post(self):
-        params = get_json_body(request)
-        current_app.logger.info(
-            "Received feedback of type {0}: {1}".format(params.get("_subject"), params)
+        params = get_json_body(
+            request,
+            max_bytes=current_app.config.get("FEEDBACK_MAX_REQUEST_BYTES", 262_144),
         )
-
-        if not self._verify_captcha(params):
+        params = schemas.validate_feedback_payload(
+            params,
+            current_app.config["FEEDBACK_FORMS_ORIGIN"],
+            current_app.config["BBB_FEEDBACK_ORIGIN"],
+        )
+        if not verify_recaptcha(params.get("g-recaptcha-response")):
             return {"message": "Captcha was not verified"}, 403
 
-        if not self._is_origin_allowed(params):
-            return {"message": "No origin provided in feedback data"}, 400
-
         email_body, attachments, submitter_email = self._prepare_email_and_attachments(params)
-        if not email_body:
-            return {"message": "Unable to generate email body"}, 500
-
-        # For associated articles append the relationship type to the subject
-        subject = params.get("_subject")
+        subject = params["_subject"]
         if subject == "Associated Articles":
-            subject = "{0} ({1})".format(subject, params.get("relationship"))
+            subject = f"{subject} ({params['relationship']})"
 
-        if not self._send_email(params, submitter_email, subject, email_body, attachments):
-            current_app.logger.error(
-                "Sending of email failed. Feedback data submitted by {0}: {1}".format(
-                    submitter_email, params
-                )
-            )
-
-        slack_data = self._prepare_slack_data(params, subject, email_body)
-        if slack_data:
-            slack_response = self._post_to_slack(slack_data)
-            if "Slack API" in slack_response.text:
-                return {
-                    "message": "Re-directed due to malformed request or incorrect end point"
-                }, 302
-            elif slack_response.status_code != 200:
-                return {"message": "Unknown error"}, slack_response.status_code
-
-        return {"message": "success"}, 200
-
-    def _verify_captcha(self, params):
-        return verify_recaptcha(request) and params.get("g-recaptcha-response", False)
-
-    def _is_origin_allowed(self, params):
-        return params.get("origin", None) in current_app.config["FEEDBACK_ALLOWED_ORIGINS"]
-
-    def _send_email(self, params, submitter_email, subject, email_body, attachments):
-        try:
-            send_feedback_email(
-                params.get("name", "TownCrier"),
-                submitter_email,
-                subject,
-                email_body,
-                attachments,
-            )
-            return True
-        except Exception as e:  # noqa
-            current_app.logger.error("Failed to send feedback email from user: {} with error {}".format(submitter_email, e))
-            return False
-
-    def _post_to_slack(self, slack_data):
-        try:
-            slack_response = requests.post(
-                url=current_app.config["FEEDBACK_SLACK_END_POINT"],
-                data=json.dumps(slack_data),
-                timeout=60,
-            )
-        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as ex:
-            current_app.logger.error("Failed to post to slack", ex)
-            abort(504)
-
-        current_app.logger.info("Slack response: {0}".format(slack_response.status_code))
-
-        # Slack annoyingly redirects if you have the wrong end point
-        current_app.logger.info("Slack API" in slack_response.text)
-
-        return slack_response
+        email_result, slack_result = enqueue_feedback_notifications(
+            params.get("name", "TownCrier"),
+            submitter_email,
+            subject,
+            email_body,
+            attachments,
+            self._prepare_slack_data(params, subject, email_body),
+        )
+        delivery = {
+            "email": email_result.state.value,
+            "slack": slack_result.state.value,
+        }
+        if all(
+            outcome.state == DeliveryState.QUEUED
+            for outcome in (email_result, slack_result)
+        ):
+            return {"message": "accepted", "delivery": delivery}, 202
+        return {"message": "Notification service unavailable", "delivery": delivery}, 503
 
     def _prepare_email_and_attachments(self, params):
-        """
-        Prepares the email body and attachments for sending user feedback emails
-        :param params: POST request data
-        :return: email body and attachments
-        """
-        try:
-            params_copy = copy(params)
-            feedback_templates = current_app.config["FEEDBACK_TEMPLATES"]
-            template = feedback_templates.get(params_copy["_subject"], None)
-            if params.get("origin") == current_app.config["FEEDBACK_FORMS_ORIGIN"]:
-                email_body, attachments = self._prepare_feedbackform_email(params_copy, template)
-                submitter_email = params.get("email")
+        template = current_app.config["FEEDBACK_TEMPLATES"].get(params["_subject"])
+        attachments = self._prepare_attachments(params, template)
+        body = self._prepare_email_body(params, template)
+        submitter_email = (
+            params["email"]
+            if params["origin"] == current_app.config["FEEDBACK_FORMS_ORIGIN"]
+            else params["_replyto"]
+        )
+        return body, attachments, submitter_email
 
-            elif params.get("origin") == current_app.config["BBB_FEEDBACK_ORIGIN"]:
-                email_body, attachments = self._prepare_bbb_feedback_email(params_copy, template)
-                submitter_email = params.get("_replyto")
-            else:
-                return None, None, None
-
-        except Exception as e:
-            current_app.logger.error("Error while processing feedback form data: {0}".format(e))
-            return None, None, None
-
-        return email_body, attachments, submitter_email
+    @staticmethod
+    def _escape_slack_text(value):
+        controlled = "".join(
+            char
+            for char in str(value)
+            if char in "\n\t" or (ord(char) >= 32 and ord(char) != 127)
+        )
+        return controlled.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
     def _prepare_slack_data(self, params, subject, email_body):
         forms_origin = current_app.config["FEEDBACK_FORMS_ORIGIN"]
-        is_origin_feedback_form = params.get("origin") == forms_origin
-
+        is_form = params["origin"] == forms_origin
         text = (
-            'Received data from feedback form "{0}" from {1}'.format(subject, params.get("email"))
-            if is_origin_feedback_form
-            else "```Incoming Feedback```\n" + email_body
+            f'Received data from feedback form "{subject}" from {params["email"]}'
+            if is_form
+            else f"Incoming Feedback\n{email_body}"
         )
-
-        channel = params.get("channel", "#feedback")
-        username = params.get("username", "TownCrier")
-        icon_emoji = (
-            current_app.config["FORM_SLACK_EMOJI"]
-            if is_origin_feedback_form
-            else current_app.config["FEEDBACK_SLACK_EMOJI"]
-        )
-
-        return {
+        text = self._escape_slack_text(text)
+        payload = {
             "text": text,
-            "channel": channel,
-            "username": username,
-            "icon_emoji": icon_emoji,
+            "channel": current_app.config["FEEDBACK_SLACK_CHANNEL"],
+            "username": current_app.config["FEEDBACK_SLACK_USERNAME"],
+            "icon_emoji": (
+                current_app.config["FORM_SLACK_EMOJI"]
+                if is_form
+                else current_app.config["FEEDBACK_SLACK_EMOJI"]
+            ),
+            "mrkdwn": False,
         }
-
-    def _prepare_feedbackform_email(self, params, template):
-        """
-        Prepares the email body and attachments for sending user feedback emails
-        :param params: POST request data
-        :return: email body and attachments
-        """
-
-        email_body = self._prepare_email_body(params, template)
-        attachments = self._prepare_attachments(params, template)
-
-        return email_body, attachments
-
-    def _prepare_bbb_feedback_email(self, params, template):
-        """
-        Prepares the email body and attachments for sending user feedback emails
-        :param params: POST request data
-        :return: email body and attachments
-        """
-
-        keys_to_remove = ["channel", "username", "name", "_replyto", "g-recaptcha-response"]
-        params = {k: v for k, v in params.items() if k not in keys_to_remove}
-
-        params["_subject"] = "Bumblebee Feedback"
-        params["comments"] = params["comments"].encode("utf-8")
-
-        email_body = self._prepare_email_body(params, template)
-
-        return email_body, []
+        max_bytes = current_app.config.get("FEEDBACK_SLACK_MAX_PAYLOAD_BYTES", 65_536)
+        encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        if len(encoded) > max_bytes:
+            available = max(max_bytes - 1024, 0)
+            payload["text"] = payload["text"].encode("utf-8")[:available].decode(
+                "utf-8", errors="ignore"
+            )
+            encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode(
+                "utf-8"
+            )
+        if len(encoded) > max_bytes:
+            raise RequestEntityTooLarge("Slack payload is too large")
+        return payload
 
     def _prepare_email_body(self, params, template):
         if not template:
-            raise ValueError("No template found for {0}".format(params["_subject"]))
-
+            raise ValueError(f"No template found for {params['_subject']}")
+        render_params = dict(params)
         if template.get("update", False):
-            try:
-                params["diff"] = make_json_diff(params["original"], params["updated"])
-            except:  # noqa
-                params["diff"] = unquote(params.get("diff", ""))
+            render_params["diff"] = make_json_diff(params["original"], params["updated"])
         elif template.get("new", False):
-            try:
-                params["new"]["author_list"] = ";".join([a for a in params["new"]["authors"]])
-            except:  # noqa
-                params["new"]["author_list"] = ""
-
-        body = render_template(template["file"], data=params)
-        body = body.replace("[tab]", "\t")
-
+            new_record = dict(params["new"])
+            new_record["author_list"] = ";".join(new_record.get("authors", []))
+            render_params["new"] = new_record
+        body = render_template(template["file"], data=render_params).replace("[tab]", "\t")
+        if len(body.encode("utf-8")) > 262_144:
+            raise RequestEntityTooLarge("Rendered feedback body is too large")
         return body
 
     def _prepare_attachments(self, params, template):
-        attachments = []
-
-        if template.get("new", False) or template.get("update", False):
-            attachments.append((template["file"], params["new"]))
-
+        records = []
+        if template.get("new", False):
+            records.append(("new_record.json", params["new"]))
         if template.get("update", False):
-            attachments.append(("original_record.json", params["original"]))
+            records.extend(
+                (
+                    ("updated_record.json", params["updated"]),
+                    ("original_record.json", params["original"]),
+                )
+            )
+        if len(records) > 2:
+            raise RequestEntityTooLarge("Too many feedback attachments")
 
+        attachments = []
+        total = 0
+        for filename, record in records:
+            encoded = json.dumps(
+                record,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+            if len(encoded) > 131_072:
+                raise RequestEntityTooLarge("Feedback attachment is too large")
+            total += len(encoded)
+            if total > 262_144:
+                raise RequestEntityTooLarge("Feedback attachments are too large")
+            attachments.append((filename, encoded))
         return attachments
 
 
@@ -1019,11 +1015,15 @@ class UserResolverView(Resource):
             user_id = int(id)
         except ValueError:
             user_id = None
+        try:
+            email_id = canonicalize_email(id) if "@" in id else id
+        except ValueError:
+            email_id = None
 
         u = User.query.filter(
             or_(
                 User.id == user_id,
-                User.email == id,
+                User.email == email_id,
                 User.fs_uniquifier == id,
             )
         ).first()

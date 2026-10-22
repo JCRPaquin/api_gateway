@@ -45,6 +45,7 @@ def app(request):
             ],
             "HTTPS_ENFORCEMENT": False,
             "TRUSTED_PROXY_HOPS": 0,
+            "SECURITY_EMAIL_VALIDATOR_ARGS": {"check_deliverability": False},
         },
         allow_insecure_test_config=True,
         name=request.node.name,

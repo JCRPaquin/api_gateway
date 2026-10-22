@@ -1,3 +1,6 @@
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
+
 from datetime import datetime
 from unittest import mock
 from unittest.mock import MagicMock, patch
@@ -9,10 +12,22 @@ from marshmallow import ValidationError
 from werkzeug.exceptions import Unauthorized
 
 from apigateway import views
-from apigateway.email_templates import EmailChangedNotification, VerificationEmail
-from apigateway.models import AnonymousUser, EmailChangeRequest, User
+from apigateway.email_templates import EmailChangedNotification
+from apigateway.exceptions import NotFoundError
+from apigateway.models import (
+    AnonymousUser,
+    EmailChangeRequest,
+    PasswordChangeRequest,
+    User,
+)
 from apigateway.schemas import bootstrap_response
-from apigateway.utils import ProxyView, generate_complete_blocklist, normalize_email_domain
+from apigateway.domains import canonicalize_domain
+from apigateway.utils import (
+    DeliveryResult,
+    DeliveryState,
+    ProxyView,
+    generate_complete_blocklist,
+)
 
 
 class TestBootstrapView:
@@ -173,12 +188,16 @@ class TestProxyView:
         response = client.get("/proxy")
         assert response.data == b"504 Gateway Timeout"
         assert response.status_code == 504
+        assert response.content_type == "text/html; charset=utf-8"
+        assert response.content_length is not None
 
     def test_proxy_request_timeout(self, client, mock_session, mock_redis_service):
         mock_session.return_value.get.side_effect = requests.exceptions.Timeout
         response = client.get("/proxy")
         assert response.data == b"504 Gateway Timeout"
         assert response.status_code == 504
+        assert response.content_type == "text/html; charset=utf-8"
+        assert response.content_length is not None
 
     def test_allowed_headers(self, app, client, mock_session, mock_redis_service):
         response = client.get("/proxy")
@@ -227,6 +246,7 @@ class TestUserManagementView:
             "email": "testuser@gmail.com",
             "password1": "test_passwordU1",
             "password2": "test_passwordU1",
+            "g-recaptcha-response": "test-captcha",
         }
 
     @pytest.fixture
@@ -249,8 +269,9 @@ class TestUserManagementView:
 
     def test_post_new_user(self, app, user_management_view, new_user_data):
         with app.test_request_context(json=new_user_data):
-            _, status_code = user_management_view.post()
-            assert status_code == 200
+            response, status_code = user_management_view.post()
+            assert status_code == 202
+            assert response == {"message": views.ACCOUNT_ACCEPTED_MESSAGE}
 
     def test_post_new_user_invalid_data(self, app, user_management_view, new_user_data):
         new_user_data["email"] = "invalid_email"
@@ -276,7 +297,7 @@ class TestUserManagementView:
             assert status_code == 400
 
     def test_domain_policy_normalizes_curated_entries(self):
-        assert normalize_email_domain(" BlobApps.COM.\n") == "blobapps.com"
+        assert canonicalize_domain(" BlobApps.COM.\n") == "blobapps.com"
         assert "blobapps.com" in generate_complete_blocklist()
 
     def test_post_existing_user(self, app, user_management_view, authenticated_user):
@@ -286,12 +307,13 @@ class TestUserManagementView:
             "password1": "test_passwordU1",
             "password2": "test_passwordU1",
             "email": authenticated_user.email,
+            "g-recaptcha-response": "test-captcha",
         }
 
         with app.test_request_context(json=existing_user):
             response, status_code = user_management_view.post()
-            assert status_code == 200
-            assert "error" not in response
+            assert status_code == 202
+            assert response == {"message": views.ACCOUNT_ACCEPTED_MESSAGE}
 
     def test_delete_user(self, app, user_management_view, authenticated_user):
         with app.test_request_context():
@@ -412,6 +434,199 @@ class TestChangePasswordView:
             assert "error" in response
 
 
+class TestResetPasswordView:
+    @pytest.fixture
+    def reset_action(self, app):
+        app.db.session.remove()
+        with app.session_scope() as session:
+            user = User(
+                id=123,
+                active=True,
+                confirmed_at=datetime.utcnow(),
+                email="reset@gmail.com",
+                password="Old_valid_password1",
+                fs_uniquifier="reset_user",
+            )
+            action = PasswordChangeRequest(user=user)
+            session.add_all([user, action])
+            session.commit()
+            return {
+                "user_id": user.id,
+                "action_id": action.id,
+                "token": app.security_service.generate_password_token(
+                    action.delivery_id
+                ),
+            }
+
+    @staticmethod
+    def _request(app, view, token, password="New_valid_password1"):
+        with app.test_request_context(
+            method="PUT",
+            json={"password1": password, "password2": password},
+        ):
+            return view.put(token)
+
+    def test_put_commits_password_and_consumes_only_exact_action(
+        self, app, reset_action
+    ):
+        with app.session_scope() as session:
+            later_action = PasswordChangeRequest(user_id=reset_action["user_id"])
+            session.add(later_action)
+            session.commit()
+            later_action_id = later_action.id
+
+        response, status_code = self._request(
+            app, views.ResetPasswordView(), reset_action["token"]
+        )
+
+        assert status_code == 200
+        assert response == {"message": "success"}
+        user = app.db.session.query(User).get(reset_action["user_id"])
+        assert user.validate_password("New_valid_password1")
+        assert (
+            app.db.session.query(PasswordChangeRequest).get(
+                reset_action["action_id"]
+            )
+            is None
+        )
+        assert (
+            app.db.session.query(PasswordChangeRequest).get(later_action_id)
+            is not None
+        )
+
+    def test_put_rolls_back_password_and_action_when_final_commit_crashes(
+        self, app, reset_action
+    ):
+        with app.session_scope() as session:
+            session_class = type(session)
+        with patch.object(
+            session_class, "commit", side_effect=RuntimeError("commit crashed")
+        ):
+            with pytest.raises(RuntimeError, match="commit crashed"):
+                self._request(app, views.ResetPasswordView(), reset_action["token"])
+
+        app.db.session.expire_all()
+        user = app.db.session.query(User).get(reset_action["user_id"])
+        assert user.validate_password("Old_valid_password1")
+        assert not user.validate_password("New_valid_password1")
+        assert (
+            app.db.session.query(PasswordChangeRequest).get(
+                reset_action["action_id"]
+            )
+            is not None
+        )
+
+    def test_replay_fails_without_deleting_a_later_generation(
+        self, app, reset_action
+    ):
+        view = views.ResetPasswordView()
+        self._request(app, view, reset_action["token"])
+        with app.session_scope() as session:
+            later_action = PasswordChangeRequest(user_id=reset_action["user_id"])
+            session.add(later_action)
+            session.commit()
+            later_action_id = later_action.id
+
+        with pytest.raises(NotFoundError):
+            self._request(
+                app, view, reset_action["token"], password="Another_valid_password1"
+            )
+        app.db.session.expire_all()
+        user = app.db.session.query(User).get(reset_action["user_id"])
+        assert user.validate_password("New_valid_password1")
+        assert not user.validate_password("Another_valid_password1")
+        assert (
+            app.db.session.query(PasswordChangeRequest).get(later_action_id)
+            is not None
+        )
+
+
+    def test_generation_replacing_candidate_before_action_lock_is_preserved(
+        self, app, reset_action
+    ):
+        # SQLite has no row-level FOR UPDATE semantics, so model only the
+        # generation change between the initial lookup and locked revalidation.
+        candidate = MagicMock(user_id=reset_action["user_id"])
+        with app.session_scope() as session:
+            session.query(PasswordChangeRequest).filter_by(
+                id=reset_action["action_id"]
+            ).delete()
+            later_action = PasswordChangeRequest(user_id=reset_action["user_id"])
+            session.add(later_action)
+            session.commit()
+            later_action_id = later_action.id
+
+        verify_action = app.security_service.verify_password_action
+
+        def verify_after_generation(token, session=None, for_update=False):
+            if not for_update:
+                return candidate
+            return verify_action(token, session=session, for_update=True)
+
+        with patch.object(
+            app.security_service,
+            "verify_password_action",
+            side_effect=verify_after_generation,
+        ):
+            with pytest.raises(NotFoundError):
+                self._request(
+                    app,
+                    views.ResetPasswordView(),
+                    reset_action["token"],
+                )
+
+        app.db.session.expire_all()
+        user = app.db.session.query(User).get(reset_action["user_id"])
+        assert user.validate_password("Old_valid_password1")
+        assert (
+            app.db.session.query(PasswordChangeRequest).get(later_action_id)
+            is not None
+        )
+
+    def test_concurrent_replay_blocks_then_fails_on_postgresql(
+        self, app, reset_action
+    ):
+        if app.db.engine.dialect.name != "postgresql":
+            pytest.skip("SQLite does not implement the required row-level locks")
+
+        initial_reads = Barrier(2)
+        verify_action = app.security_service.verify_password_action
+
+        def synchronized_verify(token, session=None, for_update=False):
+            action = verify_action(token, session=session, for_update=for_update)
+            if not for_update:
+                initial_reads.wait(timeout=10)
+            return action
+
+        def redeem():
+            with app.app_context():
+                try:
+                    self._request(
+                        app, views.ResetPasswordView(), reset_action["token"]
+                    )
+                except NotFoundError:
+                    return "replay"
+                return "success"
+
+        with patch.object(
+            app.security_service,
+            "verify_password_action",
+            side_effect=synchronized_verify,
+        ):
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                outcomes = list(executor.map(lambda _: redeem(), range(2)))
+
+        assert sorted(outcomes) == ["replay", "success"]
+        app.db.session.expire_all()
+        assert (
+            app.db.session.query(PasswordChangeRequest).get(
+                reset_action["action_id"]
+            )
+            is None
+        )
+
+
+
 class TestChangeEmailView:
     @pytest.fixture
     def change_email_view(self):
@@ -437,48 +652,59 @@ class TestChangeEmailView:
 
     @pytest.fixture
     def send_email_mock(self):
-        with mock.patch("apigateway.views.send_email") as _mock:
-            yield _mock
+        queued = DeliveryResult("email", DeliveryState.QUEUED, "queued")
+        with mock.patch(
+            "apigateway.views.enqueue_notification", return_value=queued
+        ) as action_mail, mock.patch(
+            "apigateway.views.enqueue_template_email", return_value=queued
+        ) as notice_mail:
+            yield action_mail, notice_mail
 
     def test_post_change_email(self, app, change_email_view, authenticated_user, send_email_mock):
         old_email = authenticated_user.email
+        action_mail, notice_mail = send_email_mock
         with app.test_request_context(
             json={"password": "Valid_password1", "email": "new_email@gmail.com"},
         ):
             login_user(authenticated_user)
             _, status_code = change_email_view.post()
-            assert status_code == 200
-            send_email_mock.assert_any_call(
-                app.config["MAIL_DEFAULT_SENDER"],
-                "new_email@gmail.com",
-                VerificationEmail,
-                verification_url=mock.ANY,
+            assert status_code == 202
+            assert action_mail.call_args.args[0] == "email_change_verification"
+            assert action_mail.call_args.args[1]["action_id"] > 0
+            assert action_mail.call_args.args[1]["ui_env"] == "ADS"
+            assert action_mail.call_args.kwargs["commit"] is False
+            notice_mail.assert_called_once_with(
+                old_email,
+                EmailChangedNotification,
                 ui_env="ADS",
                 ui_url="https://ui.adsabs.harvard.edu",
-            )
-            send_email_mock.assert_any_call(
-                app.config["MAIL_DEFAULT_SENDER"], old_email, EmailChangedNotification, ui_env=mock.ANY, ui_url=mock.ANY,
+                dedupe_key=f"change-email-notify:{authenticated_user.id}",
+                session=mock.ANY,
+                commit=False,
+                replace=True,
             )
 
     def test_post_change_email_scix(self, app, change_email_view, authenticated_user, send_email_mock):
         old_email = authenticated_user.email
+        action_mail, notice_mail = send_email_mock
         with app.test_request_context(
             json={"password": "Valid_password1", "email": "new_email@gmail.com"},
             headers={"Host": "scixplorer.org"},
         ):
             login_user(authenticated_user)
             _, status_code = change_email_view.post()
-            assert status_code == 200
-            send_email_mock.assert_any_call(
-                app.config["MAIL_DEFAULT_SENDER"],
-                "new_email@gmail.com",
-                VerificationEmail,
-                verification_url=mock.ANY,
+            assert status_code == 202
+            assert action_mail.call_args.args[1]["ui_env"] == "SciX"
+            assert action_mail.call_args.args[1]["ui_url"] == "https://scixplorer.org"
+            notice_mail.assert_called_once_with(
+                old_email,
+                EmailChangedNotification,
                 ui_env="SciX",
                 ui_url="https://scixplorer.org",
-            )
-            send_email_mock.assert_any_call(
-                app.config["MAIL_DEFAULT_SENDER"], old_email, EmailChangedNotification, ui_env=mock.ANY, ui_url=mock.ANY,
+                dedupe_key=f"change-email-notify:{authenticated_user.id}",
+                session=mock.ANY,
+                commit=False,
+                replace=True,
             )
 
     def test_post_change_email_incorrect_password(

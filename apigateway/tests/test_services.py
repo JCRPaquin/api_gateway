@@ -1,4 +1,6 @@
-from unittest.mock import MagicMock, call
+import hashlib
+
+from unittest.mock import MagicMock, PropertyMock, call, patch
 
 import pytest
 from flask import g, request
@@ -455,6 +457,108 @@ class TestLimiterService:
         # Assert
         assert counter2 == 9  # 9 because of rate limit multiplier of 3 for current user
 
+    def test_adaptive_cost_uses_prior_completed_mean_and_charges_surcharge(self, app):
+        service = app.limiter_service
+        request_limit = MagicMock()
+        request_limit.limit = MagicMock()
+        request_limit.request_args = ["/slow", "scope"]
+        request_limit.key = "/slow:identity:scope"
+        request_limit.scope = "endpoint-scope"
+        app.config.update(
+            LIMITER_SERVICE_SCALING_COST_ENABLED=True,
+            LIMITER_SERVICE_SCALING_COST_THRESHOLD=100,
+            LIMITER_SERVICE_MAX_COST=10,
+        )
+        with app.test_request_context("/slow"), patch.object(
+            service, "_key_func", return_value="/slow"
+        ), patch(
+            "apigateway.services.time.monotonic_ns", return_value=8_000_000_000
+        ), patch(
+            "apigateway.services.extensions.storage_service.atomic_snapshot_and_add",
+            return_value=(100_000_000, 100),
+        ) as aggregate, patch.object(
+            type(service), "current_limits", new_callable=PropertyMock, return_value=[request_limit]
+        ), patch.object(
+            service.limiter, "hit"
+        ) as hit:
+            cost = service._record_completed_request(0)
+
+        assert cost == 10
+        digest = hashlib.sha256(
+            b'["/slow:identity:scope","endpoint-scope"]'
+        ).hexdigest()
+        aggregate.assert_called_once_with(
+            f"LIMITER_SERVICE//adaptive/{digest}/total_microseconds",
+            f"LIMITER_SERVICE//adaptive/{digest}/count",
+            8_000_000,
+            600,
+        )
+        hit.assert_called_once_with(request_limit.limit, "/slow", "scope", cost=9)
+
+    def test_adaptive_accounting_runs_after_handler_and_explicit_cost_opts_out(self, app):
+        service = app.limiter_service
+        events = []
+        app.config["LIMITER_SERVICE_SCALING_COST_ENABLED"] = True
+
+        adaptive = service.shared_limit("100/minute")(
+            lambda: events.append("handler")
+        )
+        explicit = service.shared_limit("100/minute", cost=3)(
+            lambda: events.append("explicit-handler")
+        )
+        with app.test_request_context("/ordered"), patch.object(
+            service, "check", side_effect=lambda: events.append("check")
+        ), patch(
+            "apigateway.services.time.monotonic_ns", return_value=123
+        ), patch.object(
+            service,
+            "_record_completed_request",
+            side_effect=lambda started: events.append(("record", started)),
+        ) as record:
+            adaptive()
+            explicit()
+
+        assert events == [
+            "check",
+            "handler",
+            ("record", 123),
+            "check",
+            "explicit-handler",
+        ]
+        record.assert_called_once_with(123)
+
+    def test_adaptive_accounting_skips_failed_handlers(self, app):
+        service = app.limiter_service
+        app.config["LIMITER_SERVICE_SCALING_COST_ENABLED"] = True
+
+        def fail():
+            raise RuntimeError("handler failed")
+
+        adaptive = service.shared_limit("100/minute")(fail)
+        with app.test_request_context("/failed"), patch.object(
+            service, "check"
+        ), patch.object(service, "_record_completed_request") as record:
+            with pytest.raises(RuntimeError):
+                adaptive()
+        record.assert_not_called()
+
+    def test_zero_prior_mean_is_clamped_to_base_cost(self, app):
+        service = app.limiter_service
+        app.config["LIMITER_SERVICE_SCALING_COST_ENABLED"] = True
+        with app.test_request_context("/zero"), patch.object(
+            service, "_key_func", return_value="/zero"
+        ), patch(
+            "apigateway.services.time.monotonic_ns", return_value=1_000_000
+        ), patch(
+            "apigateway.services.extensions.storage_service.atomic_snapshot_and_add",
+            return_value=(0, 100),
+        ), patch.object(
+            type(service), "current_limits", new_callable=PropertyMock, return_value=[]
+        ):
+            assert service._record_completed_request(0) == 1
+
+
+
 
 class TestSecurityService:
     def test_create_user(self, app):
@@ -490,6 +594,24 @@ class TestSecurityService:
         updated_user = app.security_service.change_password(user, new_password)
         assert updated_user.password != new_password
         assert updated_user.validate_password(new_password)
+
+    def test_change_password_can_join_caller_transaction(self, app):
+        user = app.security_service.create_user(
+            "transactional-password@gmail.com", "Old_valid_password1"
+        )
+
+        updated_user = app.security_service.change_password(
+            user,
+            "New_valid_password1",
+            session=app.db.session,
+            commit=False,
+        )
+        assert updated_user.validate_password("New_valid_password1")
+
+        app.db.session.rollback()
+        persisted_user = app.db.session.query(User).filter_by(id=user.id).one()
+        assert persisted_user.validate_password("Old_valid_password1")
+        assert not persisted_user.validate_password("New_valid_password1")
 
     def test_validate_email(self, app):
         valid_email = "test@gmail.com"

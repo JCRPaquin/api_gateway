@@ -3,7 +3,6 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
-from flask import request
 from werkzeug.exceptions import BadRequest
 from apigateway.config import (
     DEBUG,
@@ -274,7 +273,7 @@ def test_testing_without_explicit_bypass_calls_recaptcha(app, monkeypatch):
             json={"g-recaptcha-response": "response"},
             headers={"Host": "attacker-shadow"},
         ):
-            assert verify_recaptcha(request) is False
+            assert verify_recaptcha("response") is False
     post.assert_called_once()
 
 

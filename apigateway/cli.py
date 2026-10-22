@@ -8,6 +8,8 @@ from sqlalchemy import and_
 
 from apigateway.app import create_app
 from apigateway.models import OAuth2Client, OAuth2Token, User
+from apigateway.notifications import cleanup_terminal_notifications, process_outbox_batch
+
 
 
 @click.group(cls=FlaskGroup, create_app=create_app)
@@ -191,6 +193,30 @@ def cleanup_clients(timedelta, userid, ratelimit):
             "Deleted {0} oauth2clients whose last_activity was "
             "at least {1} old and userid={2}".format(deletions, timedelta, userid)
         )
+
+
+@cli.group("notifications", short_help="Process durable notification outbox")
+def notifications():
+    """Notification delivery worker commands."""
+    pass
+
+
+@notifications.command("work")
+@click.option("--once", is_flag=True, help="Process one claim batch and exit.")
+def work_notifications(once):
+    """Deliver queued notifications with bounded retries."""
+    while True:
+        processed = process_outbox_batch()
+        if once:
+            return
+        if processed == 0:
+            time.sleep(current_app.config.get("MAIL_OUTBOX_POLL_SECONDS", 1))
+
+@notifications.command("cleanup")
+def cleanup_notifications():
+    """Delete one bounded batch of expired terminal notification rows."""
+    deleted = cleanup_terminal_notifications()
+    click.echo(f"Deleted {deleted} terminal notifications")
 
 
 def parse_timedelta(s):

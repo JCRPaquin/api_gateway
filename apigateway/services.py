@@ -6,7 +6,9 @@ import logging
 import math
 import os
 import re
+import threading
 import time
+import uuid
 from datetime import datetime
 from functools import wraps
 from typing import Callable, Tuple
@@ -33,8 +35,16 @@ from werkzeug.datastructures import Headers
 from werkzeug.security import gen_salt
 
 from apigateway import extensions
+from apigateway.domains import canonicalize_email
 from apigateway.exceptions import NoClientError, NotFoundError, ValidationError
-from apigateway.models import AnonymousUser, OAuth2Client, OAuth2Token, Role, User
+from apigateway.models import (
+    AnonymousUser,
+    OAuth2Client,
+    OAuth2Token,
+    PasswordChangeRequest,
+    Role,
+    User,
+)
 from apigateway.utils import GatewayResourceProtector, ProxyView
 
 
@@ -414,17 +424,20 @@ class ProxyService(GatewayService):
 
         @app.after_request
         def _after_request_hook(response: Response):
+            if not getattr(g, "proxy_upstream_response", False):
+                return response
+
+            allowed_headers = {header.lower() for header in self.allowed_headers}
+            gateway_response_headers = {"content-type", "content-length"}
             filtered_headers = {
                 key: value
                 for key, value in response.headers.items()
-                if key in self.allowed_headers
+                if key.lower() in allowed_headers
+                or key.lower() in gateway_response_headers
             }
-
             response.headers.clear()
-
             for key, value in filtered_headers.items():
                 response.headers.add_header(key, value)
-
             return response
 
     def register_service(self, base_url: str, deploy_path: str, csrf_exempt: bool = True):
@@ -581,10 +594,8 @@ class LimiterService(GatewayService, Limiter):
             app (Flask): The Flask application to register the hooks with.
         """
 
-        @app.before_request
-        def _before_request_hook():
-            g.request_start_time = time.time()
-
+        # Request timing starts in the decorated admission wrapper so it includes
+        # completed handler work and is associated with the exact admitted limits.
         def _token_authenticated(sender, token=None, **kwargs):
             client = OAuth2Client.query.filter_by(id=token.client_id).first()
             level = getattr(client, "ratelimit", 1.0) if client else 0.0
@@ -666,6 +677,7 @@ class LimiterService(GatewayService, Limiter):
         if request_endpoint == "*":
             self._logger.info("Clearing all limits")
             self.reset()
+            extensions.storage_service.delete_prefix(f"{self._name}//")
         else:
             defaults, decorated = self.limit_manager.resolve_limits(self._app, request_endpoint)
             all_limits = list(defaults) + list(decorated)
@@ -675,7 +687,7 @@ class LimiterService(GatewayService, Limiter):
                 self.storage.clear(key)
 
             extensions.storage_service.delete(
-                f"{self._name}//{self._key_func(request_endpoint)}/time"
+                f"{self._name}//{self._key_func(request_endpoint)}/total_microseconds"
             )
             extensions.storage_service.delete(
                 f"{self._name}//{self._key_func(request_endpoint)}/count"
@@ -698,6 +710,8 @@ class LimiterService(GatewayService, Limiter):
         if limit_value is None and (counts is None or per_second is None):
             raise ValueError("Either limit_value or counts and per_second must be provided")
 
+        adaptive_cost = cost is None
+
         def inner(func):
             LimitDecorator(
                 self,
@@ -713,17 +727,34 @@ class LimiterService(GatewayService, Limiter):
                 exempt_when=exempt_when,
                 override_defaults=override_defaults,
                 deduct_when=deduct_when,
-                cost=cost if cost else self._cost_func,
+                cost=cost if cost is not None else 1,
             )(func)
 
             @wraps(func)
             def check(*args, **kwargs):
+                started_ns = time.monotonic_ns()
                 self.check()
-                return func(*args, **kwargs)
+                result = func(*args, **kwargs)
+                if adaptive_cost and self._is_successful_response(result):
+                    self._record_completed_request(started_ns)
+                return result
 
             return check
 
         return inner
+
+    @staticmethod
+    def _is_successful_response(result) -> bool:
+        if isinstance(result, Response):
+            return result.status_code < 400
+        if (
+            isinstance(result, tuple)
+            and len(result) > 1
+            and isinstance(result[1], int)
+        ):
+            return result[1] < 400
+        return True
+
 
     def _calculate_limit_value(self, counts: int, per_second: int) -> str:
         """Calculates the limit string for the specified counts and per second values.
@@ -757,62 +788,55 @@ class LimiterService(GatewayService, Limiter):
 
         return "{0}/{1} second".format(int(counts * multiplier), per_second)
 
-    def _cost_func(self) -> int:
-        """Calculates the cost for the rate limit.
-
-        This method calculates the cost for the rate limit based on the processing time of the request.
-
-        Returns:
-            int: The cost for the rate limit.
-        """
-
-        self._calc_new_mean_time()
-
-        if self.get_service_config("SCALING_COST_ENABLED", False):
-
-            request_count = float(
-                extensions.storage_service.get(f"{self._name}//{self._key_func()}/count") or 0
+    def _record_completed_request(self, started_ns: int) -> int:
+        if not self.get_service_config("SCALING_COST_ENABLED", False):
+            return 1
+        max_seconds = max(
+            float(self.get_service_config("MAX_ACCOUNTED_SECONDS", 60)), 0.0
+        )
+        elapsed_us = min(
+            max((time.monotonic_ns() - started_ns) // 1000, 0),
+            int(max_seconds * 1_000_000),
+        )
+        g.processing_time = elapsed_us / 1_000_000
+        threshold = max(
+            int(self.get_service_config("SCALING_COST_THRESHOLD", 100)), 0
+        )
+        max_cost = max(int(self.get_service_config("MAX_COST", 10)), 1)
+        ttl = max(
+            int(self.get_service_config("ESTIMATOR_TTL_SECONDS", 600)), 1
+        )
+        highest_cost = 1
+        for request_limit in self.current_limits:
+            effective_key = json.dumps(
+                [str(request_limit.key), str(request_limit.scope)],
+                separators=(",", ":"),
             )
-
-            if request_count > self.get_service_config("SCALING_COST_THRESHOLD", 100):
-
-                request_mean_time = float(
-                    extensions.storage_service.get(f"{self._name}//{self._key_func()}/time") or 0
+            aggregate = (
+                f"{self._name}//adaptive/"
+                f"{hashlib.sha256(effective_key.encode('utf-8')).hexdigest()}"
+            )
+            total_us, completed_count = extensions.storage_service.atomic_snapshot_and_add(
+                f"{aggregate}/total_microseconds",
+                f"{aggregate}/count",
+                elapsed_us,
+                ttl,
+            )
+            cost = 1
+            if completed_count >= threshold and completed_count > 0 and total_us > 0:
+                mean_us = total_us / completed_count
+                if mean_us > 0 and elapsed_us > mean_us:
+                    scaled = math.floor(math.log2(elapsed_us / mean_us) * 5)
+                    cost = 1 + min(max(scaled, 0), max_cost - 1)
+            surcharge = cost - 1
+            if surcharge:
+                self.limiter.hit(
+                    request_limit.limit,
+                    *request_limit.request_args,
+                    cost=surcharge,
                 )
-
-                request_time = getattr(g, "processing_time", 0)
-
-                if request_time <= request_mean_time:
-                    return 1
-
-                # Calculate the ratio of processing time to mean time
-                ratio = request_time / request_mean_time
-
-                # Calculate the cost based on the log2 of the ratio
-                #
-                # Example:
-                # 1 + log(1, 2) * 5 = 1 + 0 = 1
-                # 1 + log(2, 2) * 5 = 1 + 1 * 5 = 6
-                # 1 + log(3, 2) * 5 ≈ 1 + 1.585 * 5 ≈ 9.925
-                return 1 + min(int(math.log(ratio, 2) * 5), 9)
-
-        return 1
-
-    def _calc_new_mean_time(self):
-        processing_time: float = max(0.0, time.time() - g.request_start_time)
-
-        key_time: str = f"{self._name}//{self._key_func()}/time"
-        key_count: str = f"{self._name}//{self._key_func()}/count"
-
-        existing_time: float = float(extensions.storage_service.get(key_time) or 0)
-        request_count: int = int(extensions.storage_service.get(key_count) or 0)
-
-        new_mean_time = ((existing_time * request_count) + processing_time) / (request_count + 1)
-
-        extensions.storage_service.set(key_time, new_mean_time)
-        extensions.storage_service.set(key_count, request_count + 1)
-
-        g.processing_time = processing_time
+            highest_cost = max(highest_cost, cost)
+        return highest_cost
 
     def _key_func(self, request_endpoint=None) -> str:
         """Returns the key for the rate limit.
@@ -915,6 +939,8 @@ class StorageService(GatewayService):
     def __init__(self, name: str = "STORAGE_SERVICE"):
         super().__init__(name)
         self._fallback_storage: dict = {}
+        self._fallback_lock = threading.RLock()
+        self._fallback_expirations: dict[str, float] = {}
 
     def init_app(self, app: Flask, redis_service: RedisService):
         super().init_app(app)
@@ -937,17 +963,19 @@ class StorageService(GatewayService):
             return self._serializer.dumps(value)
 
     def _transfer_to_redis(self):
-        """
-        Transfers the data from the fallback storage to Redis.
-
-        This method iterates over the items in the fallback storage and transfers them to Redis.
-        After the transfer is complete, the fallback storage is cleared.
-        """
+        """Transfer unexpired fallback values to Redis."""
+        now = time.monotonic()
         for key, value in self._fallback_storage.items():
+            expiration = self._fallback_expirations.get(key)
+            if expiration is not None and expiration <= now:
+                continue
             if isinstance(value, dict):
                 value = json.dumps(value)
             self._redis_service.set(key, self._serialize(value))
+            if expiration is not None:
+                self._redis_service.expire(key, max(math.ceil(expiration - now), 1))
         self._fallback_storage.clear()
+        self._fallback_expirations.clear()
 
     def handle_redis_exception(func):
         def wrapper(self, *args, **kwargs):
@@ -998,6 +1026,7 @@ class StorageService(GatewayService):
         if not self._redis_down:
             return bool(self._redis_service.delete(key))
         else:
+            self._fallback_expirations.pop(key, None)
             return bool(self._fallback_storage.pop(key, None))
 
     @handle_redis_exception
@@ -1015,6 +1044,62 @@ class StorageService(GatewayService):
         else:
             self._fallback_storage[key] = self._fallback_storage.get(key, 0) + increment
             return self._fallback_storage[key]
+
+    @handle_redis_exception
+    def delete_prefix(self, prefix: str) -> int:
+        if not self._redis_down:
+            keys = list(self._redis_service.scan_iter(match=f"{prefix}*"))
+            return int(self._redis_service.delete(*keys)) if keys else 0
+        with self._fallback_lock:
+            keys = [key for key in self._fallback_storage if key.startswith(prefix)]
+            for key in keys:
+                del self._fallback_storage[key]
+                self._fallback_expirations.pop(key, None)
+            return len(keys)
+
+    @handle_redis_exception
+    def atomic_snapshot_and_add(
+        self,
+        total_key: str,
+        count_key: str,
+        elapsed_microseconds: int,
+        ttl_seconds: int,
+    ) -> tuple[int, int]:
+        """Return the prior aggregate, add a sample, and refresh the rolling TTL."""
+        ttl_seconds = max(int(ttl_seconds), 1)
+        if not self._redis_down:
+            script = """
+                local total = tonumber(redis.call('GET', KEYS[1]) or '0')
+                local count = tonumber(redis.call('GET', KEYS[2]) or '0')
+                redis.call('INCRBY', KEYS[1], ARGV[1])
+                redis.call('INCRBY', KEYS[2], 1)
+                redis.call('EXPIRE', KEYS[1], ARGV[2])
+                redis.call('EXPIRE', KEYS[2], ARGV[2])
+                return {total, count}
+            """
+            total, count = self._redis_service.eval(
+                script,
+                2,
+                total_key,
+                count_key,
+                int(elapsed_microseconds),
+                ttl_seconds,
+            )
+            return int(total), int(count)
+        with self._fallback_lock:
+            now = time.monotonic()
+            if self._fallback_expirations.get(total_key, 0) <= now:
+                self._fallback_storage.pop(total_key, None)
+            if self._fallback_expirations.get(count_key, 0) <= now:
+                self._fallback_storage.pop(count_key, None)
+            total = int(self._fallback_storage.get(total_key, 0))
+            count = int(self._fallback_storage.get(count_key, 0))
+            self._fallback_storage[total_key] = total + int(elapsed_microseconds)
+            self._fallback_storage[count_key] = count + 1
+            expiration = now + ttl_seconds
+            self._fallback_expirations[total_key] = expiration
+            self._fallback_expirations[count_key] = expiration
+            return total, count
 
     @handle_redis_exception
     def incrbyfloat(self, key: str, increment: float) -> float:
@@ -1182,7 +1267,7 @@ class SecurityService(GatewayService, Security):
 
         self._token_serializer = URLSafeTimedSerializer(self.get_service_config("SECRET_KEY"))
 
-    def create_user(self, email: str, password: str, **kwargs) -> User:
+    def create_user(self, email: str, password: str, commit: bool = True, **kwargs) -> User:
         """Creates a new user with the specified email and password.
 
         Args:
@@ -1198,6 +1283,7 @@ class SecurityService(GatewayService, Security):
             User: The created user.
         """
 
+        email = canonicalize_email(email)
         email = self._mail_util.validate(email)
         pbad, password = self._password_util.validate(password, True)
 
@@ -1206,7 +1292,10 @@ class SecurityService(GatewayService, Security):
 
         # Passwords are hashed in the setter of the model. No need to do it here.
         user = self.datastore.create_user(email=email, password=password, **kwargs)
-        self.datastore.commit()
+        if commit:
+            self.datastore.commit()
+        else:
+            self.datastore.db.session.flush()
 
         return user
 
@@ -1241,13 +1330,18 @@ class SecurityService(GatewayService, Security):
         else:
             return False
 
-    def change_password(self, user: User, password: str) -> User:
+    def change_password(
+        self, user: User, password: str, session=None, commit: bool = True
+    ) -> User:
         """
         Change the password for a given user.
 
         Args:
             user (User): The user object for which to change the password.
             password (str): The new password to set for the user.
+            session: Optional database session that owns the surrounding transaction.
+            commit (bool): Commit immediately. Callers coordinating other mutations
+                in the same transaction must pass ``False``.
 
         Raises:
             ValueError: If the new password is invalid.
@@ -1260,9 +1354,11 @@ class SecurityService(GatewayService, Security):
         if pbad is not None:
             raise ValueError(", ".join(pbad))
 
-        user = self.datastore.db.session.merge(user)
+        session = session or self.datastore.db.session
+        user = session.merge(user)
         user.password = password
-        self.datastore.commit()
+        if commit:
+            session.commit()
 
         return user
 
@@ -1277,7 +1373,7 @@ class SecurityService(GatewayService, Security):
             bool: True if the email address is valid, False otherwise.
         """
         try:
-            self._mail_util.validate(email)
+            self._mail_util.validate(canonicalize_email(email))
         except Exception:
             return False
 
@@ -1294,7 +1390,7 @@ class SecurityService(GatewayService, Security):
         Returns:
             User: The updated user object.
         """
-        email = self._mail_util.validate(email)
+        email = self._mail_util.validate(canonicalize_email(email))
 
         user = self.datastore.db.session.merge(user)
         user.email = email
@@ -1316,19 +1412,18 @@ class SecurityService(GatewayService, Security):
 
         return self.generate_token(user_id, salt=self.get_service_config("VERIFY_EMAIL_SALT"))
 
-    def generate_password_token(self, user_id: str = None) -> str:
-        """
-        Generate a password reset token for the current user.
-
-        Returns:
-            str: The password reset token.
-        """
-
-        if user_id is None:
-            user_id = current_user.id
-        current_app.logger.info("Generating password token for user: {}".format(user_id))
-
-        return self.generate_token(user_id, salt=self.get_service_config("VERIFY_PASSWORD_SALT"))
+    def generate_password_token(self, action_id: str) -> str:
+        """Generate a short-lived signed bearer for a committed reset action."""
+        try:
+            action_id = str(uuid.UUID(action_id))
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise ValueError("A committed password reset action is required") from exc
+        current_app.logger.info(
+            "Generating password token for reset action: %s", action_id
+        )
+        return self.generate_token(
+            action_id, salt=self.get_service_config("VERIFY_PASSWORD_SALT")
+        )
 
     def generate_token(self, content: str, salt: str):
         """
@@ -1339,18 +1434,28 @@ class SecurityService(GatewayService, Security):
         """
         return self._token_serializer.dumps(content, salt=salt)
 
-    def verify_password_token(self, token: str) -> User:
-        """
-        Verifies the password reset token and returns the associated user.
-
-        Args:
-            token (str): The password reset token to verify.
-
-        Returns:
-            User: The user associated with the token if it's valid, None otherwise.
-        """
+    def verify_password_action(
+        self, token: str, session=None, for_update: bool = False
+    ) -> PasswordChangeRequest:
+        """Verify a reset bearer and load the committed action it identifies."""
         salt = self.get_service_config("VERIFY_PASSWORD_SALT")
-        return self.verify_token(token, salt)
+        action_id = self._load_token(token, salt)
+        try:
+            action_id = str(uuid.UUID(action_id))
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise ValueError("unknown verification token") from exc
+        session = session or self.datastore.db.session
+        query = session.query(PasswordChangeRequest).filter_by(delivery_id=action_id)
+        if for_update:
+            query = query.with_for_update()
+        action = query.first()
+        if action is None:
+            raise NotFoundError("no action associated with that verification token")
+        return action
+
+    def verify_password_token(self, token: str) -> User:
+        """Verify a reset bearer and return its action's user."""
+        return self.verify_password_action(token).user
 
     def verify_email_token(self, token: str) -> User:
         """
@@ -1365,34 +1470,28 @@ class SecurityService(GatewayService, Security):
         salt = self.get_service_config("VERIFY_EMAIL_SALT")
         return self.verify_token(token, salt)
 
-    def verify_token(self, token: str, salt: str) -> User:
-        """
-        Verify email token and return the User object associated with the token.
-
-        Args:
-            token (str): The email verification token.
-
-        Raises:
-            ValueError: If the token is invalid or expired.
-            NotFoundError: If no user is associated with the verification token.
-            ValueError: If the user's email has already been validated.
-
-        Returns:
-            User: The user object associated with the verification token.
-        """
+    def _load_token(self, token: str, salt: str):
         try:
-            user_id = self._token_serializer.loads(token, max_age=86400, salt=salt)
+            return self._token_serializer.loads(token, max_age=86400, salt=salt)
         except Exception as ex:
             self._logger.warning(
-                "{0} verification token not validated. Reason: {1}".format(token, ex)
+                "Verification token was not validated. Reason: %s",
+                ex.__class__.__name__,
             )
-            raise ValueError("unknown verification token")
-        current_app.logger.info("Verifying token for user: {}".format(user_id))
-        user: User = User.query.filter_by(id=user_id).first()
+            raise ValueError("unknown verification token") from ex
 
+    def verify_token(self, token: str, salt: str) -> User:
+        """
+        Verify an account token and return its associated user.
+
+        Raises ValueError for invalid or expired bearers and NotFoundError when
+        the signed user identifier no longer exists.
+        """
+        user_id = self._load_token(token, salt)
+        current_app.logger.info("Verifying token for user: %s", user_id)
+        user: User = User.query.filter_by(id=user_id).first()
         if user is None:
             raise NotFoundError("no user associated with that verification token")
-
         return user
 
 

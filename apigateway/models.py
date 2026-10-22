@@ -1,3 +1,6 @@
+import uuid
+
+from datetime import datetime
 from typing import List
 
 import sqlalchemy as sa
@@ -161,6 +164,29 @@ class PasswordChangeRequest(base_model):
     __tablename__ = "password_change_request"
 
     id = sa.Column(sa.Integer, primary_key=True, autoincrement=True)
-    token = sa.Column(sa.String(255), unique=True)
+    delivery_id = sa.Column(
+        sa.String(36), unique=True, nullable=False, default=lambda: str(uuid.uuid4())
+    )
     user_id = sa.Column(sa.Integer(), sa.ForeignKey("user.id", ondelete="CASCADE"))
     user = relationship("User")
+
+
+class NotificationOutbox(base_model):
+    __tablename__ = "notification_outbox"
+
+    id = sa.Column(sa.Integer, primary_key=True, autoincrement=True)
+    event_type = sa.Column(sa.String(64), nullable=False)
+    payload = sa.Column(sa.JSON, nullable=False)
+    payload_size = sa.Column(sa.Integer, nullable=False, default=0)
+    state = sa.Column(sa.String(24), nullable=False, default="pending", index=True)
+    attempts = sa.Column(sa.Integer, nullable=False, default=0)
+    available_at = sa.Column(sa.DateTime, nullable=False, default=datetime.utcnow, index=True)
+    claimed_at = sa.Column(sa.DateTime)
+    ownership_token = sa.Column(sa.String(36), index=True)
+    dedupe_key = sa.Column(sa.String(320), unique=True)
+    last_error = sa.Column(sa.String(64))
+    terminal_at = sa.Column(sa.DateTime, index=True)
+    created_at = sa.Column(sa.DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = sa.Column(
+        sa.DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow
+    )

@@ -9,6 +9,7 @@ from authlib.integrations.sqla_oauth2 import (
 from flask import Flask, abort, current_app, jsonify, request, session
 from flask_restful import Api
 from marshmallow import ValidationError as MarshmallowValidationError
+from werkzeug.exceptions import RequestEntityTooLarge
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 from apigateway import config as gateway_config
@@ -31,6 +32,20 @@ from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExp
 
 _APP_NAME = __name__
 _PROJECT_ROOT = Path(__file__).resolve().parent
+
+
+def _request_too_large_response():
+    response = jsonify({"message": "Request body too large"})
+    response.status_code = 413
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+class GatewayApi(Api):
+    def handle_error(self, error):
+        if isinstance(error, RequestEntityTooLarge):
+            return _request_too_large_response()
+        return super().handle_error(error)
 
 
 def register_extensions(app: Flask):
@@ -176,6 +191,10 @@ def register_error_handlers(app: Flask):
     def on_405(e):
         return jsonify({"message": "Method not allowed"}), 405
 
+    @app.errorhandler(RequestEntityTooLarge)
+    def on_413(e):
+        return _request_too_large_response()
+
     @app.errorhandler(404)
     def on_404(e):
         return jsonify({"message": "Not found"}), 404
@@ -319,7 +338,7 @@ def create_app(*, allow_insecure_test_config=False, **local_config):
                 meterProvider = MeterProvider(resource=resource, metric_readers=[reader])
                 metrics.set_meter_provider(meterProvider)
 
-    flask_api = Api(app)
+    flask_api = GatewayApi(app)
     register_verbose_exception_logging(app)
     register_extensions(app)
     register_hooks(app)

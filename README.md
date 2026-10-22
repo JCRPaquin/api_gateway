@@ -174,3 +174,86 @@ alembic upgrade <revision>
 alembic downgrade <revision>
 alembic revision --autogenerate -m "revision description"
 ```
+
+## Public input and notification safety
+
+The gateway enforces a 1 MiB global request limit. Account requests are limited
+to 16 KiB and feedback requests to 256 KiB. Form parsing is limited to 64 KiB
+of in-memory data and 32 parts. Oversized requests return JSON HTTP 413 before
+CAPTCHA, database, diff, template, or notification work. JSON syntax errors,
+decoder recursion exhaustion, and configured integer-digit-limit failures
+return HTTP 400 before schema or CAPTCHA work, even when the byte body is below
+its route limit. Feedback also has schema limits for nesting, collection sizes,
+strings, records, rendered output, attachments, Slack payloads, and final MIME
+size; adjust these only after reviewing the corresponding downstream work
+bounds.
+
+Registration, password-reset requests, and verification resends return HTTP 202
+with the same account-independent message after a durable notification event is
+accepted. Queue capacity or database failure returns the account-independent
+HTTP 503 response `Notification service unavailable` with `Retry-After: 60`.
+Disposable-domain policy entries and submitted domains are compared using
+trimmed, trailing-dot-free lowercase IDNA ASCII.
+
+Registration account creation and its welcome-email outbox row are committed
+atomically. Password reset is deliberately two-stage: the worker first claims
+the account-independent request, replaces the user's prior reset action, and
+commits a requeued delivery event containing only that action's random stable
+delivery ID. A later claim locks and reloads that committed action before
+deriving a short-lived signed bearer in memory. Reset action rows contain no
+bearer, digest, or URL, and active or terminal outbox JSON never contains the
+bearer or bearer URL. The hardening migration invalidates legacy reset actions
+whose raw bearer was stored in the database.
+
+Apply the `notification_outbox` migration and run one or more workers:
+
+```bash
+apigateway notifications work
+```
+
+Workers claim one row at a time with lease ownership and `FOR UPDATE SKIP
+LOCKED` on PostgreSQL, retry transient failures up to
+`MAIL_OUTBOX_MAX_ATTEMPTS`, and retain scrubbed terminal metadata for bounded
+operator inspection. Reset generation is serialized per account, and delivery
+holds the current action lock through SMTP acceptance. Generation-specific
+dedupe IDs plus action replacement cause every stale delivery retry to be
+suppressed rather than send a superseded link. A crash after the action commit
+leaves its delivery event claimable; no SMTP call has occurred. Delivery is
+**at least once**, not exactly once: a crash after SMTP accepts a message but
+before the terminal-state commit may send the same still-current committed
+action again after lease recovery. It can never send an action superseded in
+the meantime.
+
+Password-reset generation, delivery, and redemption use the same
+`User`-then-action lock order. The password mutation and deletion of the exact
+action identified by the bearer share one transaction and one final commit. A
+failure before that commit rolls both changes back. On PostgreSQL, a concurrent
+replay waits on the user row and then fails when the consumed action is
+revalidated; SQLite does not provide equivalent row-lock concurrency. A newer
+generation is never
+deleted by redemption, and delivery of a consumed or superseded action is
+suppressed when its exact action row is absent.
+
+
+Terminal rows contain neither message payloads nor dedupe keys. Run
+`apigateway notifications cleanup` periodically to delete one bounded batch
+beyond the configured sent/suppressed and dead retention windows. Active row
+count and serialized payload bytes are both quota-controlled. Do not describe
+an enqueued message as sent.
+
+Mail delivery is enabled only with an authenticated TLS transport. Configure
+`MAIL_SERVER`, `MAIL_PORT`, `MAIL_USERNAME`, `MAIL_PASSWORD`, and either
+`MAIL_USE_STARTTLS` or `MAIL_USE_SSL`. Connect and SMTP command deadlines are
+controlled by `MAIL_CONNECT_TIMEOUT_SECONDS` and
+`MAIL_COMMAND_TIMEOUT_SECONDS`. Slack notifications also use the durable worker.
+Slack destination, username, icon, timeout, and payload bound are server
+configuration; feedback callers cannot override them, and caller text is sent
+with markup disabled and Slack metacharacters escaped.
+
+Adaptive rate-limit charging reserves one unit at admission and applies any
+additional cost only after a successful handler completes. Rolling estimators
+are isolated by the effective limiter identity and scope, expire after
+`LIMITER_SERVICE_ESTIMATOR_TTL_SECONDS`, use only prior completed samples, and
+clamp accounted work with `LIMITER_SERVICE_MAX_ACCOUNTED_SECONDS`. Total request
+cost is capped by `LIMITER_SERVICE_MAX_COST`. Explicit `cost=` callbacks opt out
+of adaptive charging.
