@@ -1,131 +1,123 @@
+import os
+import time
+
 import pytest
-from unittest.mock import patch, MagicMock
-from sqlalchemy.orm.exc import NoResultFound, MultipleResultsFound
-from scripts.generate_oauth_client import get_token, DatabaseIntegrityError
-from apigateway.models import OAuth2Client, OAuth2Token, User
-import datetime
+
+from apigateway.exceptions import ValidationError
+from apigateway.models import OAuth2Token, User
+from scripts import generate_oauth_client
+from scripts.generate_oauth_client import get_token
 
 
-def test_get_token_existing_user_existing_client(mock_add_arguments, app, mock_regular_user, mock_client, mock_simple_token):
-    with patch("apigateway.extensions.db.session.query") as mock_query:
-        mock_query.side_effect = [
-            # Mock user
-            MagicMock(filter_by=MagicMock(return_value=MagicMock(one=MagicMock(return_value=mock_regular_user)))),
-            # Mock client
-            MagicMock(filter_by=MagicMock(return_value=MagicMock(one=MagicMock(return_value=mock_client)))),
-            # Mock tokens list
-            MagicMock(filter_by=MagicMock(return_value=MagicMock(all=MagicMock(return_value=[mock_simple_token])))),
+def _owner(app, *, quota=-1, scopes="api user"):
+    with app.app_context():
+        owner = User(
+            email="operator-target@example.org",
+            fs_uniquifier="operator-target",
+            active=True,
+            ratelimit_quota=quota,
+            _allowed_scopes=scopes,
+        )
+        app.db.session.add(owner)
+        app.db.session.commit()
+
+
+def _args(*extra):
+    return [
+        "--user-email",
+        "operator-target@example.org",
+        "--name",
+        "automation",
+        "--output",
+        "-",
+        *extra,
+    ]
+
+
+def test_operator_uses_digest_storage_and_returns_raw_once(app):
+    _owner(app)
+    raw = get_token(app, _args("--scopes", "api", "--expires-in", "3600"))
+    with app.app_context():
+        token = app.db.session.query(OAuth2Token).one()
+        assert token.access_token != raw
+        assert len(token.access_token) == 64
+        assert token.token_key_id == app.config["ACCESS_TOKEN_HMAC_ACTIVE_KEY_ID"]
+        assert token.credential_purpose == "operator"
+        assert token.expires_in == 3600
+        assert app.auth_service.lookup_access_token(raw).id == token.id
+        assert "refresh_token" not in token.__table__.c
+
+
+def test_operator_rotation_revokes_previous_raw_value(app):
+    _owner(app)
+    first = get_token(app, _args("--scopes", "api"))
+    second = get_token(app, _args("--scopes", "api"))
+    with app.app_context():
+        assert first != second
+        assert app.auth_service.lookup_access_token(first) is None
+        assert app.auth_service.lookup_access_token(second) is not None
+        assert app.db.session.query(OAuth2Token).count() == 1
+
+
+def test_operator_obeys_scope_quota_and_expiry_policy(app):
+    _owner(app, quota=0, scopes="api")
+    with pytest.raises(ValidationError):
+        get_token(app, _args("--scopes", "api"))
+
+    with app.app_context():
+        owner = app.db.session.query(User).one()
+        owner.ratelimit_quota = -1
+        app.db.session.commit()
+    with pytest.raises(ValidationError):
+        get_token(app, _args("--scopes", "admin"))
+    with pytest.raises(ValidationError):
+        get_token(app, _args("--scopes", "api", "--expires-in", str(31 * 86400)))
+
+
+def test_operator_relative_expiry_is_not_fixed_calendar_time(app):
+    _owner(app)
+    before = int(time.time())
+    get_token(app, _args("--scopes", "api", "--expires-in", "120"))
+    with app.app_context():
+        token = app.db.session.query(OAuth2Token).one()
+        assert token.expires_in == 120
+        assert before + 120 <= token.expires_at() <= int(time.time()) + 120
+
+
+def test_operator_main_writes_only_raw_token_to_stdout(monkeypatch, capsys):
+    monkeypatch.setattr(
+        generate_oauth_client, "get_token", lambda app=None, argv=None: "raw-canary"
+    )
+    generate_oauth_client.main(
+        [
+            "--user-email",
+            "operator-target@example.org",
+            "--name",
+            "automation",
+            "--output",
+            "-",
         ]
-        
-        result = get_token(app)
+    )
+    captured = capsys.readouterr()
+    assert captured.out == "raw-canary\n"
+    assert captured.err == ""
 
-        assert result['access_token'] == "access_token"
-        assert result['refresh_token'] == "refresh_token"
-        assert str(result['username']) == "test@gmail.com"
 
-def test_get_token_no_result_found_exit(mock_add_arguments, app):
-    with patch("apigateway.extensions.db.session.query") as mock_query:
-
-        mock_query.return_value.filter_by.return_value.one.side_effect = NoResultFound
-        
-        with pytest.raises(SystemExit) as error:
-            get_token(app)
-        
-        assert "User with email test@gmail.com not found, and --create-user was not specified. Exiting." in str(error.value)
-    
-def test_get_token_no_result_found_create_new_user(mock_add_arguments, app, mock_simple_token):
-    mock_add_arguments.return_value.create_user = True
-    with patch("apigateway.extensions.db.session.query") as mock_query, \
-         patch("apigateway.extensions.db.session.add") as mock_add, \
-         patch("apigateway.extensions.db.session.commit") as mock_commit:
-
-        mock_query.return_value.filter_by.return_value.one.side_effect = NoResultFound
-
-        mock_query.return_value.filter_by.return_value.all.return_value = [mock_simple_token]
-        
-        get_token(app)
-
-        # Check if a new user was created
-        mock_add.assert_called()
-        mock_commit.assert_called()
-
-def test_get_token_multiple_users_raises_error(mock_add_arguments, app):
-    with patch("apigateway.extensions.db.session.query") as mock_query:
-        mock_query.return_value.filter_by.return_value.one.side_effect = MultipleResultsFound
-
-        with pytest.raises(DatabaseIntegrityError):
-            get_token(app)
-
-def test_get_token_multiple_clients_raises_error(mock_add_arguments, app, mock_regular_user):
-    with patch("apigateway.extensions.db.session.query") as mock_query:
-
-        mock_query.side_effect = [
-            # Mock user
-            MagicMock(filter_by=MagicMock(return_value=MagicMock(one=MagicMock(return_value=mock_regular_user)))),
-            # Mock client
-            MagicMock(filter_by=MagicMock(return_value=MagicMock(one=MagicMock(side_effect=MultipleResultsFound))))
-        ]
-        
-        with pytest.raises(DatabaseIntegrityError) as error:
-            get_token(app)
-
-        assert ('Multiple oauthclients found for that user and name.' in str(error.value))
-
-def test_create_client_and_metadata(mock_add_arguments, app, mock_regular_user, mock_simple_token):
-   with patch("apigateway.extensions.db.session.query") as mock_query, \
-         patch("apigateway.extensions.db.session.add") as mock_add,  \
-         patch("apigateway.extensions.db.session.commit") as mock_commit:
-        
-        mock_query.side_effect = [
-            # Mock user
-            MagicMock(filter_by=MagicMock(return_value=MagicMock(one=MagicMock(return_value=mock_regular_user)))),
-            # Mock client
-            MagicMock(filter_by=MagicMock(return_value=MagicMock(one=MagicMock(side_effect=NoResultFound)))), 
-            # Mock tokens list
-            MagicMock(filter_by=MagicMock(return_value=MagicMock(all=MagicMock(return_value=[mock_simple_token])))),
-        ]
-        
-        get_token(app)
-
-        # Get the created client from the mock
-        created_client = mock_add.call_args[0][0]
-        
-        # Assert that the created client's attributes correspond to the args
-        assert created_client.user_id == mock_regular_user.get_id()
-        assert created_client.ratelimit_multiplier == 1.0
-        assert created_client.individual_ratelimit_multipliers is None
-        assert created_client.client_metadata["client_name"] == mock_add_arguments.return_value.name
-        assert created_client.client_metadata["description"] == mock_add_arguments.return_value.description
-        assert created_client.client_metadata["scope"] == " ".join(mock_add_arguments.return_value.scopes)
-        
-        # Assert that commit was called to save the client to the database
-        mock_add.assert_called_once()
-        mock_commit.assert_called_once()
-
-def test_get_token_no_tokens_found(mock_add_arguments, app, mock_regular_user, mock_client, mock_simple_token):
-    mock_simple_token.scope = "fake_scope_1 fake_scope_2"
-    with patch("apigateway.extensions.db.session.query") as mock_query, \
-         patch("apigateway.extensions.db.session.add") as mock_add,  \
-         patch("apigateway.extensions.db.session.commit") as mock_commit:
-        
-        mock_query.side_effect = [
-            # Mock user
-            MagicMock(filter_by=MagicMock(return_value=MagicMock(one=MagicMock(return_value=mock_regular_user)))),
-            # Mock client
-            MagicMock(filter_by=MagicMock(return_value=MagicMock(one=MagicMock(return_value=mock_client)))), 
-            # Mock tokens list
-            MagicMock(filter_by=MagicMock(return_value=MagicMock(all=MagicMock(return_value=[mock_simple_token])))),
-        ]
-
-        get_token(app)
-
-        created_token = mock_add.call_args[0][0]
-        
-        mock_add.assert_called()
-        mock_commit.assert_called()
-
-        assert created_token.user_id == mock_regular_user.get_id()
-        assert created_token.client_id == mock_client.id
-        assert created_token.scope == mock_client.scope
-        assert created_token.is_personal == mock_add_arguments.return_value.is_personal 
-        assert created_token.is_internal == True 
+def test_operator_main_creates_exclusive_mode_0600_file(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        generate_oauth_client, "get_token", lambda app=None, argv=None: "file-canary"
+    )
+    output = tmp_path / "credential"
+    arguments = [
+        "--user-email",
+        "operator-target@example.org",
+        "--name",
+        "automation",
+        "--output",
+        str(output),
+    ]
+    generate_oauth_client.main(arguments)
+    assert output.read_text() == "file-canary\n"
+    assert os.stat(output).st_mode & 0o777 == 0o600
+    with pytest.raises(FileExistsError):
+        generate_oauth_client.main(arguments)

@@ -1,6 +1,7 @@
 import binascii
 import hashlib
 import json
+import secrets
 from datetime import datetime
 
 from authlib.integrations.flask_oauth2 import current_token
@@ -133,73 +134,102 @@ def _verify_email_action(session, token: str, *, for_update: bool = False):
 
 
 class BootstrapView(Resource):
+    """Issue browser credentials with POST; GET exposes metadata only."""
 
-    decorators = [extensions.auth_service.require_oauth(optional=True)]
-
-    def get(self):
-        params = schemas.bootstrap_request.load(_account_body())
-
-        if not current_user.is_authenticated:
-            bootstrap_user: User = User.query.filter_by(is_anonymous_bootstrap_user=True).first()
-            if not bootstrap_user or not login_user(bootstrap_user):
-                abort(500, message="Could not login as bootstrap user")
-
-        if current_user.is_anonymous_bootstrap_user and (
-            params.scope or params.client_name or params.redirect_uri
-        ):
-            abort(
-                401,
-                message="""Sorry, you cant change scope/name/redirect_uri when creating temporary OAuth application""",
-            )
-
-        if current_user.is_anonymous_bootstrap_user:
-            client_id: str = None
-            if "oauth_client" in session:
-                client_id = session["oauth_client"]
-            elif current_token:
-                client_id = current_token.client.client_id
-
-            if client_id:
-                try:
-                    client, token = extensions.auth_service.load_client(client_id)
-                except exceptions.NoClientError:
-                    client, token = extensions.auth_service.bootstrap_anonymous_user()
-                    session["oauth_client"] = client.client_id
-            # Check if the client_id is valid and that there is no client/user mismatch
-            if not client_id or (
-                client.user_id != current_user.get_id()
-                and not current_user.is_anonymous_bootstrap_user
-            ):
-                client, token = extensions.auth_service.bootstrap_anonymous_user()
-                session["oauth_client"] = client.client_id
-
-        else:
-            client, token = extensions.auth_service.bootstrap_user(
-                client_name=params.client_name,
-                scope=params.scope,
-                ratelimit_multiplier=params.ratelimit,
-                individual_ratelimit_multipliers=params.individual_ratelimits,
-                expires=params.expires,
-                create_client=params.create_new,
-            )
-
+    @staticmethod
+    def _response(client, token, access_token=None):
         response = {
-            "access_token": token.access_token,
-            "refresh_token": token.refresh_token,
             "expires_at": token.expires_at(),
             "token_type": token.token_type,
-            "scopes": token.scope.split(" ") if token.scope else [],
+            "scopes": token.scope.split() if token.scope else [],
             "username": token.user.email,
             "anonymous": token.user.is_anonymous_bootstrap_user,
             "client_id": client.client_id,
             "client_name": client.client_name,
-            "client_secret": client.client_secret,
             "ratelimit": client.ratelimit_multiplier,
             "individual_ratelimits": client.individual_ratelimit_multipliers,
             "given_name": token.user.given_name,
             "family_name": token.user.family_name,
         }
-        return schemas.bootstrap_response.dump(response), 200
+        if access_token is not None:
+            response["access_token"] = access_token
+        return response
+
+    def get(self):
+        if request.headers.get("Authorization"):
+            abort(401)
+        if not current_user.is_authenticated:
+            return {"message": "No browser credential found"}, 200
+        if current_user.is_anonymous_bootstrap_user:
+            binding_id = session.get("oauth_binding")
+            if not binding_id:
+                return {"message": "No browser credential found"}, 200
+            purpose = "anonymous"
+            binding = extensions.auth_service.binding_digest(binding_id)
+        else:
+            purpose = "browser"
+            binding = None
+        credential = extensions.auth_service.get_credential_metadata(
+            current_user, purpose=purpose, binding_digest=binding
+        )
+        if credential is None:
+            return {"message": "No browser credential found"}, 200
+        client, token = credential
+        return self._response(client, token), 200
+
+    def post(self):
+        if request.headers.get("Authorization"):
+            abort(401)
+        params = schemas.bootstrap_request.load(_account_body())
+        login_anonymous_owner = not current_user.is_authenticated
+        owner = (
+            current_app.config["ANONYMOUS_BOOTSTRAP_USER_EMAIL"]
+            if login_anonymous_owner
+            else current_user.get_id()
+        )
+        anonymous = login_anonymous_owner or current_user.is_anonymous_bootstrap_user
+
+        if anonymous:
+            if (
+                params.scope is not None
+                or params.client_name is not None
+                or params.individual_ratelimits is not None
+                or params.ratelimit != 1.0
+            ):
+                abort(401)
+            try:
+                admitted = extensions.auth_service.admit_anonymous_issuance(
+                    request.remote_addr or "unknown"
+                )
+            except Exception:
+                abort(503, message="Anonymous credential admission unavailable")
+            if not admitted:
+                abort(429, message="Anonymous credential issuance limit exceeded")
+            binding_id = session.get("oauth_binding")
+            if binding_id is None:
+                binding_id = secrets.token_urlsafe(24)
+                session["oauth_binding"] = binding_id
+            purpose = "anonymous"
+            binding = extensions.auth_service.binding_digest(binding_id)
+        else:
+            purpose = "browser"
+            binding = None
+
+        issued = extensions.auth_service.issue_credential(
+            owner,
+            purpose=purpose,
+            scopes=params.scope,
+            expires_in=params.expires_in,
+            client_name=params.client_name,
+            ratelimit_multiplier=params.ratelimit,
+            individual_ratelimit_multipliers=params.individual_ratelimits,
+            binding_digest=binding,
+        )
+        if login_anonymous_owner and not login_user(issued.token.user):
+            abort(500, message="Anonymous credential owner is unavailable")
+        return self._response(
+            issued.client, issued.token, access_token=issued.access_token
+        ), 201
 
 
 class UserAuthView(Resource):
@@ -754,46 +784,37 @@ class LimiterManagementView(Resource):
 
 
 class UserInfoView(Resource):
-    """
-    Implements getting user info from session ID, access token or
-    client id. It should be limited to internal use only.
+    """Resolve non-secret identifiers for trusted internal callers.
+
+    ``me`` resolves the bearer record already validated by the resource
+    protector. Raw bearer credentials are never accepted in this URL.
     """
 
-    decorators = [
-        # extensions.limiter_service.shared_limit("500/43200 second"),
-        extensions.auth_service.require_oauth("adsws:internal"),
-    ]
+    decorators = [extensions.auth_service.require_oauth("adsws:internal")]
 
     def get(self, account_data):
-        """
-        This endpoint provides the full identifying data associated to a given
-        session, user id, access token or client id. Example:
+        if account_data == "me":
+            return self._translate(current_token, source="bearer")
 
-        curl -H 'authorization: Bearer:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
-            'https://dev.adsabs.harvard.edu/v1/accounts/info/yyyy'
-
-        Where 'yyyy' can be a session, access token, user id or client id.
-
-        Notice that sessions are not server side, but client stored and server
-        signed to avoid user manipulation.
-        """
-        ## Input data can be a session, a access token or a user id
-        # 1) Try to treat input data as a session
+        # First try a signed browser session. Sessions are client-stored and
+        # server-signed; they do not disclose the associated bearer value.
         try:
             session_data = self._decodeFlaskCookie(account_data)
-            if "oauth_client" in session_data:
-                # Anonymous users always have their oauth_client id in the session
+            if "oauth_binding" in session_data:
+                binding = extensions.auth_service.binding_digest(
+                    session_data["oauth_binding"]
+                )
                 token = (
                     OAuth2Token.query.join(OAuth2Client)
-                    .filter(OAuth2Client.client_id == session_data["oauth_client"])
+                    .filter(
+                        OAuth2Client.credential_purpose == "anonymous",
+                        OAuth2Client.binding_digest == binding,
+                    )
                     .first()
                 )
                 if token:
-                    return self._translate(token, source="session:client_id")
-                else:
-                    # Token not found in database
-                    return {"message": "Identifier not found [ERR 010]"}, 404
-
+                    return self._translate(token, source="session:binding")
+                return {"message": "Identifier not found [ERR 010]"}, 404
             elif "user_id" in session_data:
                 # There can be more than one token per user (generally one for
                 # BBB and one for API requests), when client id is not stored
@@ -847,10 +868,7 @@ class UserInfoView(Resource):
             # Try next identifier type
             pass
 
-        # 2) Try to treat input data as access token
-        token = OAuth2Token.query.filter_by(access_token=account_data).first()
-        if token:
-            return self._translate(token, source="access_token")
+        # Raw access tokens are intentionally not interpreted as path values.
 
         # 3) Try to treat input data as client id
         token = (
@@ -875,7 +893,7 @@ class UserInfoView(Resource):
             "hashed_user_id": hashed_user_id,  # Permanent, all the anonymous users will have hashed_client_id instead
             "hashed_client_id": hashed_client_id,  # A single user has a client ID for the BB token and another for the API, anonymous users have a unique client ID linked to the anonymous user id (id 1)
             "anonymous": anonymous,  # True, False or None if email could not be retreived/anonymous validation could not be executed
-            "source": source,  # Identifier used to recover information: session:client_id, session:user_id, user_id, access_token, client_id
+            "source": source,
         }, 200
 
     def _decodeFlaskCookie(self, cookie_value):
@@ -1057,121 +1075,46 @@ class PersonalTokenView(Resource):
         require_non_anonymous_bootstrap_user,
     ]
 
-    def get(self):
-        clients = (
-            OAuth2Client.query.filter_by(user_id=current_user.get_id())
-            .order_by(OAuth2Client.client_id_issued_at.desc())
-            .all()
-        )
-
-        client = next((c for c in clients if c.client_name == "ADS API client"), None)
-
-        if not client:
-            return {"message": "No ADS API client found"}, 200
-
-        token = OAuth2Token.query.filter_by(
-            client_id=client.id,
-            user_id=current_user.get_id(),
-        ).first()
-
-        if not token:
-            current_app.logger.error(
-                "No token found for ADS API Client with id {0}. This should not happen!".format(
-                    client.id
-                )
-            )
-            return {"message": "No token found for ADS API client"}, 500
-
+    @staticmethod
+    def _response(client, token, access_token=None):
         response = {
-            "access_token": token.access_token,
-            "refresh_token": token.refresh_token,
             "expires_at": token.expires_at(),
             "token_type": token.token_type,
-            "scopes": token.scope.split(" ") if token.scope else [],
+            "scopes": token.scope.split() if token.scope else [],
             "username": token.user.email,
-            "anonymous": token.user.is_anonymous_bootstrap_user,
             "client_id": client.client_id,
-            "user_id": current_user.get_id(),
+            "user_id": token.user_id,
         }
+        if access_token is not None:
+            response["access_token"] = access_token
+        return response
 
-        return schemas.personal_token_response.dump(response), 200
-
-    def put(self):
-        salt_length = current_app.config.get("OAUTH2_CLIENT_ID_SALT_LEN", 40)
-
-        clients = (
-            OAuth2Client.query.filter_by(user_id=current_user.get_id())
-            .order_by(OAuth2Client.client_id_issued_at.desc())
-            .all()
+    def get(self):
+        if request.headers.get("Authorization"):
+            abort(401)
+        credential = extensions.auth_service.get_credential_metadata(
+            current_user, purpose="personal"
         )
+        if credential is None:
+            return {"message": "No personal token found"}, 200
+        return self._response(*credential), 200
 
-        client = next((c for c in clients if c.client_name == "ADS API client"), None)
-
-        with current_app.session_scope() as session:
-            if not client:
-                client = OAuth2Client(
-                    user_id=current_user.get_id(),
-                    last_activity=datetime.now(),
-                )
-                client.set_client_metadata(
-                    {
-                        "client_name": "ADS API client",
-                        "description": "ADS API client",
-                        "scope": " ".join(current_app.config.get("USER_API_DEFAULT_SCOPES", "")),
-                        "is_internal": True,
-                    }
-                )
-                client.gen_salt()
-
-                session.add(client)
-                session.commit()
-
-                token = OAuth2Token(
-                    token_type="Bearer",
-                    client_id=client.id,
-                    user_id=client.user_id,
-                    access_token=gen_salt(salt_length),
-                    refresh_token=gen_salt(salt_length),
-                    scope=" ".join(current_app.config.get("USER_API_DEFAULT_SCOPES", "")),
-                    expires_in=(datetime(2050, 1, 1) - datetime.now()).total_seconds(),
-                )
-                session.add(token)
-
-            else:
-                token = (
-                    session.query(OAuth2Token)
-                    .filter_by(
-                        client_id=client.id,
-                        user_id=current_user.get_id(),
-                    )
-                    .first()
-                )
-
-                if not token:
-                    current_app.logger.error(
-                        "No token found for ADS API Client with id {0}. This should not happen!".format(
-                            client.id
-                        )
-                    )
-                    return {"message": "No token found for the ADS API client"}, 500
-
-                token.access_token = gen_salt(salt_length)
-
-            session.commit()
-
-            response = {
-                "access_token": token.access_token,
-                "refresh_token": token.refresh_token,
-                "expires_at": token.expires_at(),
-                "token_type": token.token_type,
-                "scopes": token.scope.split(" ") if token.scope else [],
-                "username": token.user.email,
-                "anonymous": token.user.is_anonymous_bootstrap_user,
-                "client_id": client.client_id,
-                "user_id": current_user.get_id(),
-            }
-
-            return schemas.personal_token_response.dump(response), 200
+    def post(self):
+        if request.headers.get("Authorization"):
+            abort(401)
+        params = schemas.bootstrap_request.load(_account_body())
+        issued = extensions.auth_service.issue_credential(
+            current_user.get_id(),
+            purpose="personal",
+            scopes=params.scope,
+            expires_in=params.expires_in,
+            client_name=params.client_name or "ADS API client",
+            ratelimit_multiplier=params.ratelimit,
+            individual_ratelimit_multipliers=params.individual_ratelimits,
+        )
+        return self._response(
+            issued.client, issued.token, access_token=issued.access_token
+        ), 201
 
 
 class UserResolverView(Resource):

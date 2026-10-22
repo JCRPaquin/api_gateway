@@ -4,10 +4,12 @@ services:
     build: .
     command: >-
       sh -c "alembic upgrade head && exec gunicorn --bind=0.0.0.0:8181
-      --access-logfile=- --error-logfile=- wsgi:application"
+      --access-logfile=- --access-logformat='%(h)s %(t)s \"%(m)s %(U)s %(H)s\" %(s)s %(b)s'
+      --error-logfile=- wsgi:application"
     environment:
       OTEL_SERVICE_NAME: api-gateway
       ENABLE_OTEL: 'EXPORTER'
+      SQLALCHEMY_DATABASE_URI: postgresql://user:password@db:5432/gateway
     read_only: true
     tmpfs:
       - /tmp

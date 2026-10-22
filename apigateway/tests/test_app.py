@@ -6,6 +6,13 @@ import sys
 import textwrap
 
 from apigateway import extensions
+from apigateway.app import sanitize_telemetry_request
+from opentelemetry.instrumentation.flask import FlaskInstrumentor
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+    InMemorySpanExporter,
+)
 
 
 def test_create_app_uses_gateway_database_extension(app):
@@ -28,6 +35,10 @@ def test_environment_boot_config_is_typed_without_logging_secrets():
             "subprocess-email-salt-32-bytes-minimum"
         ),
         "GOOGLE_RECAPTCHA_PRIVATE_KEY": "subprocess-real-recaptcha-key",
+        "ACCESS_TOKEN_HMAC_ACTIVE_KEY_ID": "subprocess-v1",
+        "ACCESS_TOKEN_HMAC_KEYS": json.dumps(
+            {"subprocess-v1": "subprocess-oauth-hmac-key-32-bytes-minimum"}
+        ),
     }
     environment = os.environ.copy()
     for key in (
@@ -91,3 +102,28 @@ def test_environment_boot_config_is_typed_without_logging_secrets():
     process_output = completed.stdout + completed.stderr
     for secret in secrets.values():
         assert secret not in process_output
+
+
+def test_request_telemetry_omits_query_credentials(app):
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    instrumentor = FlaskInstrumentor()
+    instrumentor.instrument_app(
+        app,
+        tracer_provider=provider,
+        request_hook=sanitize_telemetry_request,
+    )
+    canary = "telemetry-query-credential-canary"
+    try:
+        response = app.test_client().get(
+            "/accounts/status?access_token={}".format(canary),
+            base_url="https://localhost",
+        )
+        assert response.status_code == 400
+    finally:
+        instrumentor.uninstrument_app(app)
+
+    serialized = "\n".join(span.to_json() for span in exporter.get_finished_spans())
+    assert canary not in serialized
+    assert "access_token" not in serialized

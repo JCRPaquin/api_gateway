@@ -5,7 +5,6 @@ from unittest.mock import MagicMock, PropertyMock, call, patch
 import pytest
 from flask import g, request
 
-from apigateway.exceptions import ValidationError
 from apigateway.models import OAuth2Client, OAuth2Token, User
 from apigateway.services import GatewayService
 
@@ -46,72 +45,6 @@ class TestGatewayService:
 
 
 class TestAuthService:
-    def test_load_client(self, app, mock_anon_user):
-        # Arrange
-        token = OAuth2Token(user_id=mock_anon_user.get_id(), access_token="test_token")
-        client = OAuth2Client(user_id=mock_anon_user.get_id(), client_id="test_client")
-
-        app.db.session.add(token)
-        app.db.session.add(client)
-        app.db.session.commit()
-
-        # Act
-        client, token = app.auth_service.load_client("test_client")
-
-        # Assert
-        assert client.client_id == "test_client"
-        assert token.user_id == mock_anon_user.get_id()
-
-    def test_bootstrap_anon_user(self, app, mock_anon_user):
-        # Act
-        client, token = app.auth_service.bootstrap_user()
-
-        # Assert
-        assert client.user_id == mock_anon_user.get_id()
-        assert token.user_id == mock_anon_user.get_id()
-        assert token.expires_in == app.config.get("BOOTSTRAP_TOKEN_EXPIRES")
-
-    def test_bootstrap_user(self, app, mock_regular_user):
-        # Act
-        client, token = app.auth_service.bootstrap_user()
-
-        # Assert
-        assert client.user_id == mock_regular_user.get_id()
-        assert token.user_id == mock_regular_user.get_id()
-
-    def test_bootstrap_user_no_capacity(self, app, mock_regular_user):
-        with pytest.raises(ValidationError):
-            _, _ = app.auth_service.bootstrap_user(ratelimit_multiplier=100)
-
-    def test_bootstrap_invalid_scope(self, app, mock_regular_user):
-        with pytest.raises(ValidationError):
-            _, _ = app.auth_service.bootstrap_user(scope="invalid")
-
-    def test_bootstrap_valid_scope(self, app, mock_regular_user):
-        try:
-            _, _ = app.auth_service.bootstrap_user(scope="test_scope")
-        except ValidationError:
-            pytest.fail("Unexpected ValidationError")
-
-    def test_headers_set(self, app, mock_regular_user):
-        _, token = app.auth_service.bootstrap_user()
-
-        @app.route("/test_auth_headers_set")
-        def test_route():
-            pass
-
-        with app.test_request_context(
-            "/test_auth_headers_set",
-            headers={
-                "Authorization": "Bearer " + token.access_token,
-            },
-        ):
-            # Manually call before_request functions
-            for func in app.before_request_funcs[None]:
-                func()
-
-            assert "X-api-uid" in request.headers
-
 
     def test_headers_not_set(self, app):
 

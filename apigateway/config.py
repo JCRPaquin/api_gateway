@@ -1,10 +1,12 @@
 import json
+import math
 import os
 import re
-from os import environ
 from urllib.parse import urlsplit
 
 from apigateway.exceptions import ConfigurationError
+environ = os.environ
+
 
 
 def _environment_list(name):
@@ -30,6 +32,16 @@ def _environment_int(name, default):
         return default
     try:
         return int(value)
+    except ValueError:
+        return value
+
+
+def _environment_float(name, default):
+    value = environ.get(name)
+    if value is None:
+        return default
+    try:
+        return float(value)
     except ValueError:
         return value
 
@@ -136,9 +148,26 @@ SECRET_KEY = environ.get("SECRET_KEY")
 SECRET_KEY_FILE = environ.get("SECRET_KEY_FILE")
 SECRET_KEY_ENCODING = environ.get("SECRET_KEY_ENCODING", "utf-8")
 
-# Auth
+# OAuth bearer issuance. Key-ring values are independent HMAC secrets; the
+# active key signs new credentials and every configured key validates existing
+# credentials during a bounded rotation window.
 OAUTH2_CLIENT_ID_SALT_LEN = 40
-OAUTH2_CLIENT_SECRET_SALT_LEN = 40
+ACCESS_TOKEN_HMAC_ACTIVE_KEY_ID = environ.get("ACCESS_TOKEN_HMAC_ACTIVE_KEY_ID")
+ACCESS_TOKEN_HMAC_KEYS = _environment_mapping("ACCESS_TOKEN_HMAC_KEYS")
+PERSONAL_TOKEN_EXPIRES = _environment_int("PERSONAL_TOKEN_EXPIRES", 30 * 24 * 60 * 60)
+BOOTSTRAP_TOKEN_EXPIRES = _environment_int("BOOTSTRAP_TOKEN_EXPIRES", 24 * 60 * 60)
+AUTH_SERVICE_DEFAULT_OWNER_QUOTA = _environment_float(
+    "AUTH_SERVICE_DEFAULT_OWNER_QUOTA", 2.0
+)
+ANONYMOUS_CREDENTIAL_DATABASE_CAP = _environment_int(
+    "ANONYMOUS_CREDENTIAL_DATABASE_CAP", 10000
+)
+ANONYMOUS_ISSUANCE_SOURCE_LIMIT = environ.get(
+    "ANONYMOUS_ISSUANCE_SOURCE_LIMIT", "10/3600 second"
+)
+ANONYMOUS_ISSUANCE_GLOBAL_LIMIT = environ.get(
+    "ANONYMOUS_ISSUANCE_GLOBAL_LIMIT", "1000/3600 second"
+)
 GOOGLE_RECAPTCHA_ENDPOINT = "https://www.google.com/recaptcha/api/siteverify"
 GOOGLE_RECAPTCHA_PRIVATE_KEY = environ.get("GOOGLE_RECAPTCHA_PRIVATE_KEY")
 GOOGLE_RECAPTCHA_PRIVATE_KEY_FILE = environ.get("GOOGLE_RECAPTCHA_PRIVATE_KEY_FILE")
@@ -148,7 +177,9 @@ MAIL_TEST_BYPASS = False
 # Session and browser transport policy
 PERMANENT_SESSION_LIFETIME = 3600 * 24 * 365.25  # 1 year in seconds
 SESSION_REFRESH_EACH_REQUEST = True
-ANONYMOUS_BOOTSTRAP_USER_EMAIL = "anonymous@ads"
+ANONYMOUS_BOOTSTRAP_USER_EMAIL = environ.get(
+    "ANONYMOUS_BOOTSTRAP_USER_EMAIL", "anonymous@ads"
+)
 BOOTSTRAP_CLIENT_NAME = "BB client"
 SESSION_COOKIE_PATH = "/v1"
 SESSION_COOKIE_SECURE = _environment_bool("SESSION_COOKIE_SECURE", True)
@@ -172,7 +203,9 @@ LIMITER_SERVICE_SCALING_COST_THRESHOLD = 100
 LIMITER_SERVICE_MAX_COST = 10
 LIMITER_SERVICE_MAX_ACCOUNTED_SECONDS = 60
 LIMITER_SERVICE_ESTIMATOR_TTL_SECONDS = 600
-LIMITER_SERVICE_STORAGE_URI = "redis://redis:6379/0"
+LIMITER_SERVICE_STORAGE_URI = environ.get(
+    "LIMITER_SERVICE_STORAGE_URI", "redis://redis:6379/0"
+)
 LIMITER_SERVICE_STRATEGY = "fixed-window"
 LIMITER_SERVICE_GROUPS = {
     "example": {
@@ -183,7 +216,7 @@ LIMITER_SERVICE_GROUPS = {
 }
 
 # Redis service
-REDIS_SERVICE_URL = "redis://redis:6379/0"
+REDIS_SERVICE_URL = environ.get("REDIS_SERVICE_URL", "redis://redis:6379/0")
 
 
 # Cache service
@@ -488,6 +521,88 @@ def validate_runtime_config(config, allow_insecure_test_config=False):
     for key, value in security_values.items():
         if value in duplicated_values:
             invalid.append(key)
+
+    keyring = config.get("ACCESS_TOKEN_HMAC_KEYS")
+    active_key_id = config.get("ACCESS_TOKEN_HMAC_ACTIVE_KEY_ID")
+    if keyring is None and insecure_test_mode:
+        keyring = {"test-v1": b"access-token-test-hmac-key-32-bytes-minimum"}
+        active_key_id = "test-v1"
+    normalized_keyring = {}
+    if not isinstance(keyring, dict) or not keyring:
+        invalid.append("ACCESS_TOKEN_HMAC_KEYS")
+    else:
+        for key_id, value in keyring.items():
+            if (
+                not isinstance(key_id, str)
+                or not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", key_id)
+            ):
+                invalid.append("ACCESS_TOKEN_HMAC_KEYS")
+                continue
+            decoded = _validate_signing_value(
+                value, "ACCESS_TOKEN_HMAC_KEYS", invalid
+            )
+            if decoded is not None:
+                normalized_keyring[key_id] = decoded
+    if (
+        not isinstance(active_key_id, str)
+        or active_key_id not in normalized_keyring
+    ):
+        invalid.append("ACCESS_TOKEN_HMAC_ACTIVE_KEY_ID")
+    if len(set(normalized_keyring.values())) != len(normalized_keyring):
+        invalid.append("ACCESS_TOKEN_HMAC_KEYS")
+    signing_material = set(security_values.values())
+    flask_signing_key = config.get("SECRET_KEY")
+    if isinstance(flask_signing_key, bytes):
+        signing_material.add(flask_signing_key)
+    if any(value in signing_material for value in normalized_keyring.values()):
+        invalid.append("ACCESS_TOKEN_HMAC_KEYS")
+    config["ACCESS_TOKEN_HMAC_KEYS"] = normalized_keyring
+    config["ACCESS_TOKEN_HMAC_ACTIVE_KEY_ID"] = active_key_id
+
+    for key, maximum in (
+        ("BOOTSTRAP_TOKEN_EXPIRES", 24 * 60 * 60),
+        ("PERSONAL_TOKEN_EXPIRES", 30 * 24 * 60 * 60),
+    ):
+        value = config.get(key)
+        if type(value) is not int or not 0 < value <= maximum:
+            invalid.append(key)
+    anonymous_cap = config.get("ANONYMOUS_CREDENTIAL_DATABASE_CAP")
+    if type(anonymous_cap) is not int or anonymous_cap <= 0:
+        invalid.append("ANONYMOUS_CREDENTIAL_DATABASE_CAP")
+    default_quota = config.get("AUTH_SERVICE_DEFAULT_OWNER_QUOTA")
+    if (
+        isinstance(default_quota, bool)
+        or not isinstance(default_quota, (int, float))
+        or not math.isfinite(default_quota)
+        or (default_quota < 0 and default_quota != -1)
+    ):
+        invalid.append("AUTH_SERVICE_DEFAULT_OWNER_QUOTA")
+    for key in (
+        "ANONYMOUS_ISSUANCE_SOURCE_LIMIT",
+        "ANONYMOUS_ISSUANCE_GLOBAL_LIMIT",
+    ):
+        value = config.get(key)
+        match = (
+            re.fullmatch(r"([1-9][0-9]*)/([1-9][0-9]*) second", value)
+            if isinstance(value, str)
+            else None
+        )
+        if match is None:
+            invalid.append(key)
+    if not insecure_test_mode:
+        for key in ("REDIS_SERVICE_URL", "LIMITER_SERVICE_STORAGE_URI"):
+            value = config.get(key)
+            try:
+                parsed = urlsplit(value) if isinstance(value, str) else None
+            except ValueError:
+                parsed = None
+            if (
+                parsed is None
+                or parsed.scheme not in {"redis", "rediss"}
+                or not parsed.hostname
+            ):
+                invalid.append(key)
+
 
     recaptcha, recaptcha_is_file = _resolve_secret(
         config, "GOOGLE_RECAPTCHA_PRIVATE_KEY", invalid

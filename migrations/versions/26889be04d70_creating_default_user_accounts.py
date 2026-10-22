@@ -12,6 +12,7 @@ Create Date: 2014-09-10 00:08:49.335000
 
 """
 import datetime
+import os
 
 from alembic import op
 from sqlalchemy import Boolean, DateTime, Integer, String
@@ -49,11 +50,8 @@ permissions = table(
 
 
 def get_email():
-    from apigateway.app import create_app
-
-    app = create_app()
-    email = app.config.get("ANONYMOUS_BOOTSTRAP_USER_EMAIL", "anon@ads")
-    return email
+    """Read the migration seed value without initializing the application."""
+    return os.environ.get("ANONYMOUS_BOOTSTRAP_USER_EMAIL", "anonymous@ads")
 
 
 def upgrade():

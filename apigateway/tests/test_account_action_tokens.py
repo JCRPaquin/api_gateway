@@ -1,7 +1,4 @@
-import ast
 import os
-import inspect
-from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from unittest import mock
 from urllib.parse import urlsplit
@@ -520,28 +517,14 @@ def test_successful_reset_rotates_session_revokes_oauth_and_logs_in(
         email="reset@example.com",
         fs_uniquifier="old-session-id",
     )
-    with app.session_scope() as session:
-        oauth_client = OAuth2Client(
-            user_id="old-session-id",
-            client_id="owned-client",
-        )
-        oauth_client.set_client_metadata(
-            {"client_name": "ADS API client", "scope": "user"}
-        )
-        session.add(oauth_client)
-        session.flush()
-        session.add(
-            OAuth2Token(
-                user_id="old-session-id",
-                client_id=oauth_client.id,
-                token_type="Bearer",
-                access_token="owned-access-token",
-                scope="user",
-                issued_at=1,
-                expires_in=4102444800,
-            )
-        )
-        session.commit()
+    issued = app.auth_service.issue_credential(
+        "old-session-id",
+        purpose="personal",
+        scopes=["user"],
+        expires_in=3600,
+        client_name="ADS API client",
+    )
+    raw_access_token = issued.access_token
     reset_token = issue_password_reset(app, user_id)
 
     bearer_client = app.test_client()
@@ -549,7 +532,7 @@ def test_successful_reset_rotates_session_revokes_oauth_and_logs_in(
     assert (
         bearer_client.get(
             "/accounts/protected",
-            headers={"Authorization": "Bearer owned-access-token"},
+            headers={"Authorization": "Bearer " + raw_access_token},
         ).status_code
         == 200
     )
@@ -584,7 +567,7 @@ def test_successful_reset_rotates_session_revokes_oauth_and_logs_in(
     assert (
         bearer_client.get(
             "/accounts/protected",
-            headers={"Authorization": "Bearer owned-access-token"},
+            headers={"Authorization": "Bearer " + raw_access_token},
         ).status_code
         == 401
     )
@@ -633,7 +616,13 @@ def test_failure_before_commit_rolls_back_password_session_and_consumption(app):
             OAuth2Token(
                 user_id="rollback-session-id",
                 client_id=oauth_client.id,
-                access_token="rollback-access-token",
+                token_type="Bearer",
+                access_token=app.auth_service.digest_access_token(
+                    "rollback-access-token"
+                ),
+                token_key_id="test-v1",
+                credential_purpose="browser",
+                expires_in=3600,
             )
         )
         session.commit()
@@ -887,7 +876,7 @@ def test_verification_exception_log_uses_constant_request_target(app):
         app.log_exception((RuntimeError, RuntimeError("failure"), None))
 
     assert token not in repr(logged.call_args)
-    assert "/accounts/verify" in repr(logged.call_args)
+    assert "endpoint=account_verify" in repr(logged.call_args)
 
 
 
@@ -1354,38 +1343,3 @@ def test_verification_resend_replaces_action_and_delivery(app):
     assert current.id == action.id
 
 
-def test_account_verification_migration_is_single_head_and_legacy_free():
-    from apigateway import models, notifications as notification_module, services
-
-    versions = Path(__file__).parents[2] / "migrations" / "versions"
-    revisions = {}
-    for path in versions.glob("*.py"):
-        tree = ast.parse(path.read_text())
-        values = {}
-        for node in tree.body:
-            if (
-                isinstance(node, (ast.Assign, ast.AnnAssign))
-                and isinstance(node.value, ast.Constant)
-            ):
-                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-                for target in targets:
-                    if isinstance(target, ast.Name):
-                        values[target.id] = node.value.value
-        revisions[values["revision"]] = values.get("down_revision")
-    heads = set(revisions) - {parent for parent in revisions.values() if parent}
-    assert heads == {"d4c3b2a1908f"}
-    assert revisions["d4c3b2a1908f"] == "b8f2a6d41c73"
-
-    assert not hasattr(models, "EmailChangeRequest")
-    service = services.SecurityService
-    for method in (
-        "change_email",
-        "generate_email_token",
-        "verify_email_token",
-        "generate_token",
-        "verify_token",
-    ):
-        assert not hasattr(service, method)
-    production_source = inspect.getsource(notification_module)
-    assert "EmailChangeRequest" not in production_source
-    assert "email_change_verification" not in production_source

@@ -105,47 +105,94 @@ class Role(base_model, RoleMixin):
 
 class OAuth2Client(base_model, OAuth2ClientMixin):
     __tablename__ = "oauth2client"
+    __table_args__ = (
+        sa.CheckConstraint(
+            "credential_purpose IN ('anonymous', 'browser', 'personal', 'operator')",
+            name="ck_oauth2client_credential_purpose",
+        ),
+        sa.CheckConstraint(
+            "(credential_purpose = 'anonymous' AND binding_digest IS NOT NULL) "
+            "OR (credential_purpose <> 'anonymous' AND binding_digest IS NULL)",
+            name="ck_oauth2client_anonymous_binding",
+        ),
+        sa.Index(
+            "uq_oauth2client_active_personal_owner",
+            "user_id",
+            unique=True,
+            postgresql_where=sa.text("credential_purpose = 'personal'"),
+            sqlite_where=sa.text("credential_purpose = 'personal'"),
+        ),
+    )
 
     id = sa.Column(sa.Integer, primary_key=True, autoincrement=True)
     user_id = sa.Column(
         sa.String,
         sa.ForeignKey("user.fs_uniquifier", ondelete="CASCADE"),
+        nullable=False,
         index=True,
     )
-    ratelimit_multiplier = sa.Column(sa.Float, default=1.0)
+    # This deployment is a bearer resource server; clients are public
+    # identifiers and never have a stored or issued client secret.
+    client_secret = None
+    client_secret_expires_at = None
+    ratelimit_multiplier = sa.Column(sa.Float, nullable=False, default=1.0)
     individual_ratelimit_multipliers = sa.Column(sa.JSON)
     last_activity = sa.Column(sa.DateTime, nullable=True)
+    credential_purpose = sa.Column(sa.String(16), nullable=False, default="browser")
+    binding_digest = sa.Column(sa.String(64), nullable=True, index=True)
 
     user = relationship("User")
 
     def gen_salt(self):
         self.reset_client_id()
-        self.reset_client_secret()
 
     def reset_client_id(self):
         self.client_id = gen_salt(current_app.config.get("OAUTH2_CLIENT_ID_SALT_LEN"))
 
-    def reset_client_secret(self):
-        self.client_secret = gen_salt(current_app.config.get("OAUTH2_CLIENT_SECRET_SALT_LEN"))
-
 
 class OAuth2Token(base_model, OAuth2TokenMixin):
     __tablename__ = "oauth2token"
+    __table_args__ = (
+        sa.CheckConstraint(
+            "credential_purpose IN ('anonymous', 'browser', 'personal', 'operator')",
+            name="ck_oauth2token_credential_purpose",
+        ),
+        sa.CheckConstraint(
+            "token_digest_version = 1", name="ck_oauth2token_digest_version"
+        ),
+        sa.UniqueConstraint(
+            "token_key_id",
+            "access_token",
+            name="uq_oauth2token_key_digest",
+        ),
+    )
 
     id = sa.Column(sa.Integer, primary_key=True, autoincrement=True)
     user_id = sa.Column(
         sa.String,
         sa.ForeignKey("user.fs_uniquifier", ondelete="CASCADE"),
+        nullable=False,
         index=True,
     )
     user = relationship("User")
     client_id = sa.Column(
-        sa.Integer(), sa.ForeignKey("oauth2client.id", ondelete="CASCADE"), index=True
+        sa.Integer(),
+        sa.ForeignKey("oauth2client.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     client = relationship("OAuth2Client")
+    # OAuth2TokenMixin's access_token column stores only the keyed digest.
+    # Raw bearer credentials exist only in the issuance response.
+    access_token = sa.Column(sa.String(64), nullable=False)
+    refresh_token = None
+    refresh_token_revoked_at = None
+    token_key_id = sa.Column(sa.String(64), nullable=False)
+    token_digest_version = sa.Column(sa.SmallInteger, nullable=False, default=1)
+    credential_purpose = sa.Column(sa.String(16), nullable=False, default="browser")
     is_personal = sa.Column(sa.Boolean, default=False, index=True)
     is_internal = sa.Column(sa.Boolean, default=False)
-    expires_in = sa.Column(sa.BigInteger, nullable=False, default=0)
+    expires_in = sa.Column(sa.BigInteger, nullable=False)
 
     def expires_at(self):
         if not self.expires_in:

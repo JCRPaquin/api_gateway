@@ -132,9 +132,21 @@ def register_hooks(app: Flask):
     """
 
     @app.before_request
+    def reject_query_credentials():
+        forbidden = {"access_token", "token", "refresh_token", "client_secret"}
+        if any(key.lower() in forbidden for key in request.args):
+            abort(400)
+
+    @app.before_request
     def make_session_permanent():
-        # Capability inspection must not refresh or otherwise mutate a session.
-        if request.endpoint == "account_verify" and request.method == "POST":
+        # Capability and credential metadata inspection must not refresh or
+        # otherwise mutate a browser session.
+        if (
+            request.endpoint == "account_verify" and request.method == "POST"
+        ) or (
+            request.endpoint in {"account_bootstrap", "account_personal_token"}
+            and request.method == "GET"
+        ):
             return
         session.permanent = True
 
@@ -248,14 +260,14 @@ def register_verbose_exception_logging(app: Flask):
 
         app.logger.error(
             """
-            Request:     {method} {path}
+            Request:     {method} endpoint={endpoint}
             IP:          {ip}
             Agent:       {agent_platform} | {agent_browser} {agent_browser_version}
             Raw Agent:   {agent}
             Oauth2:      {oauth_user}
             """.format(
                 method=request.method,
-                path=request.path,
+                endpoint=request.endpoint,
                 ip=request.remote_addr,
                 agent_platform=request.user_agent.platform,
                 agent_browser=request.user_agent.browser,
@@ -324,6 +336,18 @@ def register_views(flask_api: Api):
     flask_api.add_resource(views.LimiterManagementView, "/admin/limit")
     flask_api.add_resource(views.UserFeedbackView, "/feedback")
     flask_api.add_resource(views.Resources, "/resources")
+
+
+def sanitize_telemetry_request(span, environ):
+    """Remove query strings from request span attributes before export."""
+    if span is None or not span.is_recording():
+        return
+    path = "{}{}".format(
+        environ.get("SCRIPT_NAME", ""), environ.get("PATH_INFO", "")
+    ) or "/"
+    for attribute in ("http.target", "http.url", "url.full"):
+        span.set_attribute(attribute, path)
+    span.set_attribute("url.query", "")
 
 
 def create_app(*, allow_insecure_test_config=False, **local_config):

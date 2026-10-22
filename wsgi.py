@@ -3,10 +3,12 @@ from werkzeug.wrappers import Response
 from opentelemetry.instrumentation.flask import FlaskInstrumentor
 from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
 
-from apigateway.app import create_app
+from apigateway.app import create_app, sanitize_telemetry_request
 
 _gateway = create_app()
-FlaskInstrumentor.instrument_app(_gateway)
+FlaskInstrumentor.instrument_app(
+    _gateway, request_hook=sanitize_telemetry_request
+)
 
 with _gateway.app_context():
     SQLAlchemyInstrumentor().instrument(engine=_gateway.db.engine)

@@ -360,7 +360,7 @@ class ProxyView(View):
             http_method_func = getattr(self._session, request.method.lower())
 
             current_app.logger.info(
-                "Proxying %s request to %s", request.method.upper(), remote_url
+                "Proxying %s endpoint %s", request.method.upper(), request.endpoint
             )
 
             response: requests.Response = http_method_func(
@@ -371,7 +371,9 @@ class ProxyView(View):
             return response.content, response.status_code, dict(response.headers)
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
             current_app.logger.info(
-                "Gateway Timeout with %s request to %s", request.method.upper(), remote_url
+                "Gateway Timeout with %s endpoint %s",
+                request.method.upper(),
+                request.endpoint,
             )
             return b"504 Gateway Timeout", 504
 

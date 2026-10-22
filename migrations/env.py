@@ -1,14 +1,12 @@
 import os
-import sys
 from logging.config import fileConfig
 
 from alembic import context
-from sqlalchemy import engine_from_config, pool
+from sqlalchemy import create_engine, pool
+from sqlalchemy.engine import make_url
 
 from apigateway.models import base_model
 
-project_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-sys.path.append(project_dir)
 
 
 # this is the Alembic Config object, which provides
@@ -44,7 +42,7 @@ def run_migrations_offline() -> None:
     script output.
 
     """
-    url = config.get_main_option("sqlalchemy.url")
+    url = _migration_database_uri()
     context.configure(
         url=url,
         target_metadata=target_metadata,
@@ -56,18 +54,21 @@ def run_migrations_offline() -> None:
         context.run_migrations()
 
 
-def get_app_config(key):
-    opath = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    if opath not in sys.path:
-        sys.path.insert(0, opath)
-
-    from apigateway import app as application
-
-    app = application.create_app()
-
-    with app.app_context() as c:
-        print("Getting actual config for", key, app.config.get(key))
-        return app.config.get(key)
+def _migration_database_uri():
+    """Return the dedicated migration URI without exposing its value."""
+    value = os.environ.get("SQLALCHEMY_DATABASE_URI")
+    try:
+        parsed = make_url(value) if isinstance(value, str) and value else None
+    except Exception:
+        raise RuntimeError("SQLALCHEMY_DATABASE_URI is invalid") from None
+    if (
+        parsed is None
+        or parsed.get_backend_name() != "postgresql"
+        or not parsed.database
+        or not parsed.host
+    ):
+        raise RuntimeError("SQLALCHEMY_DATABASE_URI is invalid")
+    return value
 
 
 def run_migrations_online() -> None:
@@ -77,12 +78,7 @@ def run_migrations_online() -> None:
     and associate a connection with the context.
 
     """
-    cfg = config.get_section(config.config_ini_section)
-    if "use_flask_db_url" in cfg and cfg["use_flask_db_url"] == "true":
-        cfg["sqlalchemy.url"] = get_app_config("SQLALCHEMY_DATABASE_URI")
-
-    engine = engine_from_config(cfg, prefix="sqlalchemy.", poolclass=pool.NullPool)
-
+    engine = create_engine(_migration_database_uri(), poolclass=pool.NullPool)
     connection = engine.connect()
 
     context.configure(connection=connection, target_metadata=target_metadata)

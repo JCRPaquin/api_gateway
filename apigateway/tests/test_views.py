@@ -13,7 +13,6 @@ from werkzeug.exceptions import Unauthorized
 from apigateway import views
 from apigateway.email_templates import EmailChangedNotification
 from apigateway.models import AccountActionToken, AnonymousUser, User
-from apigateway.schemas import bootstrap_response
 from apigateway.domains import canonicalize_domain
 from apigateway.utils import (
     DeliveryResult,
@@ -23,57 +22,6 @@ from apigateway.utils import (
 )
 
 
-class TestBootstrapView:
-    @pytest.fixture
-    def bootstrap(self):
-        return views.BootstrapView()
-
-    @pytest.fixture
-    def authenticated_user(self, app):
-        with app.session_scope() as session:
-            user = User()
-            user.id = 123
-            user.active = True
-            user.confirmed_at = datetime.utcnow()
-            user.email = "test@gmail.com"
-            user.password = "Valid_password1"
-            user.fs_uniquifier = "test_user"
-            session.add(user)
-            session.commit()
-            yield user
-
-        with app.session_scope() as session:
-            session.delete(user)
-            session.commit()
-
-    def test_get_authenticated_user(self, app, bootstrap, mock_regular_user, authenticated_user):
-        with app.test_request_context(json={}):
-            response, status_code = bootstrap.get()
-
-            assert status_code == 200
-            assert not bootstrap_response.validate(response)
-
-    def test_get_authenticated_user_with_params(
-        self, app, bootstrap, mock_regular_user, authenticated_user
-    ):
-        req_json = {
-            "scope": "test_scope",
-            "client_name": "test_client",
-            "redirect_uri": "test_uri",
-        }
-        with app.test_request_context(json=req_json):
-            response, status_code = bootstrap.get()
-            parsed_response = bootstrap_response.load(response)
-
-            assert status_code == 200
-            assert not bootstrap_response.validate(response)
-            assert parsed_response.scopes == req_json["scope"].split(" ")
-
-    def test_get_anonymous_user_with_params(self, app, bootstrap, mock_anon_user):
-        json = {"scope": "test_scope", "client_name": "test_client", "redirect_uri": "test_uri"}
-        with app.test_request_context(json=json):
-            with pytest.raises(Unauthorized):
-                bootstrap.get()
 
 
 class TestUserAuthView:
@@ -199,6 +147,18 @@ class TestProxyView:
     def test_disallowed_headers(self, app, client, mock_session, mock_redis_service):
         response = client.get("/proxy")
         assert "test_disallowed_header" not in list(response.headers.keys())
+
+    @pytest.mark.parametrize(
+        "query_key",
+        ["access_token", "TOKEN", "Refresh_Token", "CLIENT_SECRET"],
+    )
+    def test_credential_query_keys_are_rejected_before_proxying(
+        self, client, caplog, query_key
+    ):
+        canary = "proxy-query-secret-canary"
+        response = client.get("/proxy", query_string={query_key: canary})
+        assert response.status_code == 400
+        assert canary not in caplog.text
 
 
 class TestCSRFView:

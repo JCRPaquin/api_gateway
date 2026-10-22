@@ -7,9 +7,11 @@ import logging
 import math
 import os
 import re
+import secrets
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 from typing import Callable, Tuple
@@ -17,7 +19,7 @@ from urllib.parse import urljoin
 
 import requests
 from authlib.integrations.flask_oauth2 import current_token, token_authenticated
-from authlib.integrations.sqla_oauth2 import create_bearer_token_validator
+from authlib.oauth2.rfc6750 import BearerTokenValidator
 from cachelib.serializers import RedisSerializer
 from flask import Flask, current_app, g, request
 from flask.wrappers import Response
@@ -31,15 +33,13 @@ from itsdangerous import URLSafeSerializer
 from kafka import KafkaProducer
 from redis import Redis, StrictRedis
 from redis.exceptions import ConnectionError, TimeoutError
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from werkzeug.datastructures import Headers
-from werkzeug.security import gen_salt
 
 from apigateway import extensions
 from apigateway.domains import canonicalize_email
 from apigateway.exceptions import (
     AccountActionTokenError,
-    NoClientError,
     ValidationError,
 )
 from apigateway.models import (
@@ -96,6 +96,29 @@ class GatewayService:
         return self._app.config.get(self._name + "_" + key, default)
 
 
+@dataclass(frozen=True)
+class IssuedCredential:
+    """A raw credential paired with the persisted non-secret records."""
+
+    client: OAuth2Client
+    token: OAuth2Token
+    access_token: str
+
+
+class DigestBearerTokenValidator(BearerTokenValidator):
+    """Authenticate raw bearer values against accepted keyed digests."""
+
+    def __init__(self, service):
+        super().__init__()
+        self.service = service
+
+    def authenticate_token(self, token_string):
+        return self.service.lookup_access_token(token_string)
+
+    def token_revoked(self, token):
+        return bool(getattr(token, "revoked", False))
+
+
 class AuthService(GatewayService):
     """A class that provides authentication services for the API Gateway."""
 
@@ -117,8 +140,12 @@ class AuthService(GatewayService):
             app (Flask): The Flask app to initialize the AuthService with.
         """
         super().init_app(app)
-        bearer_cls = create_bearer_token_validator(extensions.db.session, OAuth2Token)
-        self.require_oauth.register_token_validator(bearer_cls())
+        self._access_token_keys = app.config["ACCESS_TOKEN_HMAC_KEYS"]
+        self._active_access_token_key_id = app.config[
+            "ACCESS_TOKEN_HMAC_ACTIVE_KEY_ID"
+        ]
+        self.accepted_access_token_key_ids = tuple(self._access_token_keys)
+        self.require_oauth.register_token_validator(DigestBearerTokenValidator(self))
         self._register_hooks(app)
 
     def _register_hooks(self, app: Flask):
@@ -162,247 +189,382 @@ class AuthService(GatewayService):
 
         request.headers = headers
 
-    def load_client(self, client_id: str) -> Tuple[OAuth2Client, OAuth2Token]:
-        """Loads the OAuth2Client and OAuth2Token for the given client_id.
+    def digest_access_token(self, raw_token: str, key_id: str = None) -> str:
+        """Return the versioned HMAC digest used for bearer lookup."""
+        if not isinstance(raw_token, str) or not raw_token:
+            return ""
+        selected_key_id = key_id or self._active_access_token_key_id
+        key = self._access_token_keys[selected_key_id]
+        return hmac.new(
+            key, ("v1:" + raw_token).encode("utf-8"), hashlib.sha256
+        ).hexdigest()
 
-        Args:
-            client_id (str): The ID of the client to load.
+    def lookup_access_token(self, raw_token: str):
+        candidates = [
+            (key_id, self.digest_access_token(raw_token, key_id))
+            for key_id in self.accepted_access_token_key_ids
+        ]
+        if not candidates:
+            return None
+        return (
+            extensions.db.session.query(OAuth2Token)
+            .filter(
+                or_(
+                    *[
+                        (
+                            (OAuth2Token.token_key_id == key_id)
+                            & (OAuth2Token.access_token == digest)
+                        )
+                        for key_id, digest in candidates
+                    ]
+                )
+            )
+            .first()
+        )
 
-        Raises:
-            NoClientError: If the client with the given ID is not found.
+    _ANONYMOUS_ADMISSION_SCRIPT = """
+local source_count = redis.call('INCR', KEYS[1])
+if source_count == 1 then redis.call('EXPIRE', KEYS[1], ARGV[2]) end
+local global_count = redis.call('INCR', KEYS[2])
+if global_count == 1 then redis.call('EXPIRE', KEYS[2], ARGV[4]) end
+if source_count > tonumber(ARGV[1]) or global_count > tonumber(ARGV[3]) then
+    return 0
+end
+return 1
+"""
 
-        Returns:
-            Tuple[OAuth2Client, OAuth2Token]: A tuple containing the OAuth2Client and OAuth2Token for the given client_id.
-        """
-        client = OAuth2Client.query.filter_by(client_id=client_id).first()
+    @staticmethod
+    def _fixed_window_limit(value):
+        counts, remainder = value.split("/", 1)
+        seconds = remainder.split(" ", 1)[0]
+        return int(counts), int(seconds)
 
+    def admit_anonymous_issuance(self, source: str) -> bool:
+        """Atomically enforce authoritative source and global Redis limits."""
+        source_limit, source_window = self._fixed_window_limit(
+            self._app.config["ANONYMOUS_ISSUANCE_SOURCE_LIMIT"]
+        )
+        global_limit, global_window = self._fixed_window_limit(
+            self._app.config["ANONYMOUS_ISSUANCE_GLOBAL_LIMIT"]
+        )
+        now = int(time.time())
+        source_bucket = now // source_window
+        global_bucket = now // global_window
+        source_digest = hashlib.sha256(
+            (source or "unknown").encode("utf-8")
+        ).hexdigest()
+        result = extensions.redis_service.eval(
+            self._ANONYMOUS_ADMISSION_SCRIPT,
+            2,
+            "oauth:anonymous:source:{}:{}".format(source_digest, source_bucket),
+            "oauth:anonymous:global:{}".format(global_bucket),
+            source_limit,
+            source_window + 1,
+            global_limit,
+            global_window + 1,
+        )
+        return int(result) == 1
+
+    @staticmethod
+    def binding_digest(binding_id: str) -> str:
+        if not isinstance(binding_id, str) or not binding_id:
+            raise ValidationError("A browser binding is required")
+        return hashlib.sha256(("oauth-browser-v1:" + binding_id).encode()).hexdigest()
+
+    def get_credential_metadata(
+        self, owner, *, purpose: str, binding_digest: str = None
+    ):
+        """Return non-secret metadata for an owner's current credential."""
+        query = OAuth2Client.query.filter_by(
+            user_id=owner.get_id(), credential_purpose=purpose
+        )
+        if purpose == "anonymous":
+            if not binding_digest:
+                return None
+            query = query.filter_by(binding_digest=binding_digest)
+        client = query.order_by(OAuth2Client.id.desc()).first()
         if client is None:
-            raise NoClientError(f"Client {client_id} not found")
-
-        token = OAuth2Token.query.filter_by(client_id=client.id).first()
-
-        if token is None or token.is_expired():
-            token = self._create_temporary_token(client)
-            extensions.db.session.add(token)
-
-        client.last_activity = datetime.now()
-        extensions.db.session.add(client)
-        extensions.db.session.commit()
-
-        return client, token
-
-    def bootstrap_user(
-        self,
-        client_name: str = None,
-        scope: str = None,
-        ratelimit_multiplier: float = 1.0,
-        expires: datetime = datetime(2050, 1, 1),
-        create_client: bool = False,
-        individual_ratelimit_multipliers: dict = None,
-    ) -> Tuple[OAuth2Client, OAuth2Token]:
-        """Bootstraps a user with an OAuth2Client and OAuth2Token.
-
-        Args:
-            client_name (type, optional): The name of the client. Defaults to None.
-            scopes (type, optional): The scopes for the client. Defaults to None.
-            ratelimit_multiplier (float, optional): The ratelimit factor for the client. Defaults to 1.0.
-            expires (type, optional): The expiration date for the token. Defaults to datetime(2050, 1, 1).
-            create_client (bool, optional): Whether to create a new client or not. Defaults to False.
-            individual_ratelimit_multipliers (dict, optional): A dictionary of individual ratelimit multipliers for specific endpoints. Defaults to None.
-
-        Returns:
-            Tuple[OAuth2Client, OAuth2Token]: A tuple containing the OAuth2Client and OAuth2Token for the user.
-        """
-        if current_user.is_anonymous_bootstrap_user:
-            return self.bootstrap_anonymous_user()
-
-        client_name = client_name or self._app.config.get("BOOTSTRAP_CLIENT_NAME", "BB client")
-
-        clients = (
-            OAuth2Client.query.filter_by(user_id=current_user.get_id())
-            .order_by(OAuth2Client.client_id_issued_at.desc())
-            .all()
-        )
-
-        # Metadata is a computed property so we need to filter after the query
-        client = next((c for c in clients if c.client_name == client_name), None)
-
-        if client is None or create_client:
-            self._validate_ratelimit(ratelimit_multiplier)
-            self._validate_scopes(scope)
-
-            client = OAuth2Client(
-                user_id=current_user.get_id(),
-                ratelimit_multiplier=ratelimit_multiplier,
-                individual_ratelimit_multipliers=individual_ratelimit_multipliers,
-                last_activity=datetime.now(),
-            )
-            client.set_client_metadata(
-                {
-                    "client_name": client_name,
-                    "description": client_name,
-                    "scope": scope or " ".join(self._app.config.get("USER_DEFAULT_SCOPES", "")),
-                }
-            )
-
-            client.gen_salt()
-            extensions.db.session.add(client)
-            extensions.db.session.flush()
-
-            token = self._create_user_token(client, expires=expires)
-            extensions.db.session.add(token)
-
-            self._logger.info("Created BB client for {email}".format(email=current_user.email))
-        else:
-            token = OAuth2Token.query.filter_by(
+            return None
+        token = (
+            OAuth2Token.query.filter_by(
                 client_id=client.id,
-                user_id=current_user.get_id(),
-            ).first()
-
-            if token is None:
-                token = self._create_user_token(client, expires=expires)
-
-                extensions.db.session.add(token)
-                self._logger.info("Created BB client for {email}".format(email=current_user.email))
-
-            client.last_activity = datetime.now()
-            extensions.db.session.add(client)
-
-        extensions.db.session.commit()
-
+                user_id=owner.get_id(),
+                credential_purpose=purpose,
+            )
+            .order_by(OAuth2Token.id.desc())
+            .first()
+        )
+        if token is None or token.is_expired():
+            return None
         return client, token
 
-    def bootstrap_anonymous_user(self) -> Tuple[OAuth2Client, OAuth2Token]:
-        """Bootstraps an anonymous user with an OAuth2Client and OAuth2Token.
-
-        Raises:
-            ValidationError: If the current user is not an anonymous bootstrap user.
-
-        Returns:
-            Tuple[OAuth2Client, OAuth2Token]: A tuple containing the OAuth2Client and OAuth2Token for the anonymous user.
-        """
-        if not current_user.is_anonymous_bootstrap_user:
-            raise ValidationError("Only anonymous bootstrap user can create temporary tokens")
-
-        client = OAuth2Client(
-            user_id=current_user.get_id(),
-            last_activity=datetime.now(),
-        )
-
-        client.set_client_metadata(
-            {
-                "client_name": self._app.config.get("BOOTSTRAP_CLIENT_NAME", "BB client"),
-                "description": "Anonymous client",
-                "scope": " ".join(self._app.config.get("BOOTSTRAP_SCOPES", "")),
-            }
-        )
-
-        client.gen_salt()
-        extensions.db.session.add(client)
-        extensions.db.session.flush()
-
-        token = self._create_temporary_token(client)
-        extensions.db.session.add(token)
-        extensions.db.session.commit()
-
-        return client, token
-
-    def _create_user_token(
+    def issue_credential(
         self,
-        client: OAuth2Client,
-        expires=datetime(2050, 1, 1),
-    ) -> OAuth2Token:
-        """Creates an OAuth2Token for the given OAuth2Client.
+        owner,
+        *,
+        purpose: str,
+        scopes=None,
+        expires_in: int = None,
+        client_name: str = None,
+        ratelimit_multiplier: float = 1.0,
+        individual_ratelimit_multipliers: dict = None,
+        binding_digest: str = None,
+        rotate: bool = True,
+    ) -> IssuedCredential:
+        """Create or rotate a bearer credential in one locked transaction.
 
-        Args:
-            client (OAuth2Client): The OAuth2Client to create the token for.
-            expires (type, optional): The expiration date for the token. Defaults to datetime(2050, 1, 1).
-
-        Returns:
-            OAuth2Token: The created OAuth2Token.
+        ``owner`` is explicit by design: this policy primitive never derives
+        authorization from Flask's ``current_user``.
         """
-        salt_length = self._app.config.get("OAUTH2_CLIENT_ID_SALT_LEN", 40)
+        db_session = extensions.db.session
+        try:
+            locked_owner = self._lock_owner(db_session, owner)
+            self._validate_owner_and_purpose(
+                locked_owner, purpose, binding_digest=binding_digest
+            )
+            resolved_scopes = self._resolve_and_validate_scopes(
+                locked_owner, purpose, scopes
+            )
+            lifetime = self._validate_expiry(purpose, expires_in)
+            base_capacity, route_capacities = self._validate_capacities(
+                ratelimit_multiplier, individual_ratelimit_multipliers
+            )
 
-        token = OAuth2Token(
-            token_type="bearer",
-            client_id=client.id,
-            user_id=client.user_id,
-            access_token=gen_salt(salt_length),
-            refresh_token=gen_salt(salt_length),
-            scope=client.scope,
-            expires_in=(expires - datetime.now()).total_seconds(),
+            existing = self._find_locked_client(
+                db_session,
+                locked_owner,
+                purpose,
+                binding_digest=binding_digest,
+            )
+            if existing is not None and not rotate:
+                raise ValidationError("An active credential already exists")
+
+            requested_capacity = max(
+                [base_capacity] + list(route_capacities.values())
+            )
+            self._enforce_quota(
+                db_session,
+                locked_owner,
+                requested_capacity,
+                purpose,
+                existing_client=existing,
+            )
+
+            if existing is None:
+                client = OAuth2Client(
+                    user_id=locked_owner.get_id(),
+                    ratelimit_multiplier=base_capacity,
+                    individual_ratelimit_multipliers=route_capacities or None,
+                    last_activity=datetime.now(),
+                    credential_purpose=purpose,
+                    binding_digest=binding_digest,
+                )
+                client.set_client_metadata(
+                    {
+                        "client_name": client_name
+                        or self._default_client_name(purpose),
+                        "description": client_name
+                        or self._default_client_name(purpose),
+                        "scope": " ".join(resolved_scopes),
+                    }
+                )
+                client.gen_salt()
+                db_session.add(client)
+                db_session.flush()
+            else:
+                client = existing
+                client.ratelimit_multiplier = base_capacity
+                client.individual_ratelimit_multipliers = route_capacities or None
+                client.last_activity = datetime.now()
+                client.set_client_metadata(
+                    {
+                        "client_name": client_name or client.client_name,
+                        "description": client_name or client.client_name,
+                        "scope": " ".join(resolved_scopes),
+                    }
+                )
+                db_session.query(OAuth2Token).filter_by(client_id=client.id).delete(
+                    synchronize_session=False
+                )
+
+            raw_token = secrets.token_urlsafe(32)
+            token = OAuth2Token(
+                token_type="Bearer",
+                client_id=client.id,
+                user_id=locked_owner.get_id(),
+                access_token=self.digest_access_token(raw_token),
+                token_key_id=self._active_access_token_key_id,
+                token_digest_version=1,
+                scope=" ".join(resolved_scopes),
+                expires_in=lifetime,
+                credential_purpose=purpose,
+                is_personal=purpose in {"personal", "operator"},
+            )
+            db_session.add(token)
+            db_session.commit()
+            return IssuedCredential(client, token, raw_token)
+        except Exception:
+            db_session.rollback()
+            raise
+
+    def _lock_owner(self, db_session, owner):
+        query = db_session.query(User)
+        if isinstance(owner, User):
+            if owner.id is not None:
+                query = query.filter(User.id == owner.id)
+            else:
+                query = query.filter(User.fs_uniquifier == owner.get_id())
+        elif isinstance(owner, str):
+            query = query.filter(
+                or_(User.fs_uniquifier == owner, User.email == owner)
+            )
+        else:
+            raise ValidationError("A valid credential owner is required")
+        locked_owner = query.with_for_update().one_or_none()
+        if locked_owner is None:
+            raise ValidationError("Credential owner not found")
+        return locked_owner
+
+    def _validate_owner_and_purpose(self, owner, purpose, *, binding_digest):
+        if purpose not in {"anonymous", "browser", "personal", "operator"}:
+            raise ValidationError("Invalid credential purpose")
+        if not owner.active:
+            raise ValidationError("Credential owner is inactive")
+        if purpose == "anonymous":
+            if not owner.is_anonymous_bootstrap_user or not binding_digest:
+                raise ValidationError("Invalid anonymous credential owner or binding")
+        elif owner.is_anonymous_bootstrap_user:
+            raise ValidationError("Anonymous owners cannot receive this credential")
+
+    def _default_client_name(self, purpose):
+        if purpose in {"personal", "operator"}:
+            return "ADS API client"
+        return self._app.config.get("BOOTSTRAP_CLIENT_NAME", "BB client")
+
+    def _resolve_and_validate_scopes(self, owner, purpose, scopes):
+        if scopes is None:
+            key = (
+                "BOOTSTRAP_SCOPES"
+                if purpose == "anonymous"
+                else "USER_API_DEFAULT_SCOPES"
+                if purpose in {"personal", "operator"}
+                else "USER_DEFAULT_SCOPES"
+            )
+            scopes = self._app.config.get(key, [])
+        elif isinstance(scopes, str):
+            scopes = scopes.split()
+        if not isinstance(scopes, (list, tuple)) or any(
+            not isinstance(scope, str) or not scope for scope in scopes
+        ):
+            raise ValidationError("Scopes must be a list of non-empty strings")
+        resolved = tuple(dict.fromkeys(scopes))
+        allowed = set(owner.allowed_scopes)
+        if "*" not in allowed and not allowed.issuperset(resolved):
+            raise ValidationError("Requested scopes exceed the owner's allowed scopes")
+        return resolved
+
+    def _validate_expiry(self, purpose, expires_in):
+        maximum = 24 * 60 * 60 if purpose == "anonymous" else 30 * 24 * 60 * 60
+        if expires_in is None:
+            expires_in = (
+                self._app.config.get("BOOTSTRAP_TOKEN_EXPIRES", maximum)
+                if purpose == "anonymous"
+                else self._app.config.get("PERSONAL_TOKEN_EXPIRES", maximum)
+            )
+        if (
+            isinstance(expires_in, bool)
+            or not isinstance(expires_in, (int, float))
+            or not math.isfinite(expires_in)
+            or expires_in <= 0
+            or expires_in > maximum
+        ):
+            raise ValidationError("Credential lifetime is outside the allowed bound")
+        return int(expires_in)
+
+    def _validate_capacities(self, base, routes):
+        def valid(value):
+            return (
+                not isinstance(value, bool)
+                and isinstance(value, (int, float))
+                and math.isfinite(value)
+                and value > 0
+            )
+
+        if not valid(base):
+            raise ValidationError("Rate-limit capacity must be finite and positive")
+        if routes is None:
+            return float(base), {}
+        if not isinstance(routes, dict):
+            raise ValidationError("Route capacities must be an object")
+        registered = set(self._app.view_functions)
+        normalized = {}
+        for endpoint, value in routes.items():
+            if (
+                not isinstance(endpoint, str)
+                or endpoint not in registered
+                or not valid(value)
+            ):
+                raise ValidationError(
+                    "Route capacities require exact registered endpoint names "
+                    "and finite positive values"
+                )
+            normalized[endpoint] = float(value)
+        return float(base), normalized
+
+    def _find_locked_client(
+        self, db_session, owner, purpose, *, binding_digest=None
+    ):
+        query = db_session.query(OAuth2Client).filter_by(
+            user_id=owner.get_id(), credential_purpose=purpose
         )
+        if purpose == "anonymous":
+            query = query.filter_by(binding_digest=binding_digest)
+        return query.with_for_update().first()
 
-        return token
+    @staticmethod
+    def _client_capacity(client):
+        route_values = (client.individual_ratelimit_multipliers or {}).values()
+        return max([client.ratelimit_multiplier] + list(route_values))
 
-    def _create_temporary_token(self, client: OAuth2Client) -> OAuth2Token:
-        """Creates a temporary OAuth2Token for the given OAuth2Client.
-
-        Args:
-            client (OAuth2Client): The OAuth2Client to create the token for.
-
-        Raises:
-            ValidationError: If the current user is not an anonymous bootstrap user.
-
-        Returns:
-            OAuth2Token: The created temporary OAuth2Token.
-        """
-        if not current_user.is_anonymous_bootstrap_user:
-            raise ValidationError("Only bootstrap user can create temporary tokens")
-
-        salt_length = self._app.config.get("OAUTH2_CLIENT_ID_SALT_LEN", 40)
-        expires_in: int = self._app.config.get("BOOTSTRAP_TOKEN_EXPIRES", 3600 * 24)
-
-        return OAuth2Token(
-            token_type="bearer",
-            client_id=client.id,
-            user_id=client.user_id,
-            access_token=gen_salt(salt_length),
-            refresh_token=gen_salt(salt_length),
-            scope=client.scope,
-            expires_in=expires_in,
-        )
-
-    def _validate_ratelimit(self, requested_ratelimit: float):
-        """
-        Check if the current user has enough capacity to create a new client.
-
-        Args:
-            requested_ratelimit (float): The amount of capacity requested for the new client.
-
-        Raises:
-            ValidationError: If the current user account does not have enough capacity to create a new client.
-        """
-        quota = current_user.ratelimit_quota or 2.0
+    def _enforce_quota(
+        self, db_session, owner, requested, purpose, *, existing_client=None
+    ):
+        quota = owner.ratelimit_quota
+        if quota is None:
+            quota = self._app.config.get("AUTH_SERVICE_DEFAULT_OWNER_QUOTA", 2.0)
+        if (
+            isinstance(quota, bool)
+            or not isinstance(quota, (int, float))
+            or not math.isfinite(quota)
+            or (quota < 0 and quota != -1)
+        ):
+            raise ValidationError("Owner rate-limit quota is invalid")
+        if quota == 0:
+            raise ValidationError("Credential issuance is suspended")
+        if purpose == "anonymous" and existing_client is None:
+            cap = self._app.config["ANONYMOUS_CREDENTIAL_DATABASE_CAP"]
+            count = (
+                db_session.query(func.count(OAuth2Client.id))
+                .filter(OAuth2Client.credential_purpose == "anonymous")
+                .scalar()
+            )
+            if count >= cap:
+                raise ValidationError("Anonymous credential capacity is exhausted")
         if quota == -1:
             return
-
-        used_ratelimit = (
-            extensions.db.session.query(func.sum(OAuth2Client.ratelimit_multiplier).label("sum"))
-            .filter(OAuth2Client.user_id == current_user.get_id())
-            .first()[0]
-            or 0.0
+        query = (
+            db_session.query(OAuth2Client)
+            .join(OAuth2Token)
+            .filter(
+                OAuth2Client.user_id == owner.get_id(),
+                OAuth2Token.issued_at + OAuth2Token.expires_in > int(time.time()),
+            )
         )
-
-        if quota - (used_ratelimit + requested_ratelimit) < 0:
-            raise ValidationError(
-                "The current user account (%s) does not have enough capacity to create a new client. Requested: %s, Available: %s"
-                % (current_user.email, requested_ratelimit, quota - used_ratelimit)
-            )
-
-    def _validate_scopes(self, scopes: str):
-        allowed_scopes = set(current_user.allowed_scopes)
-
-        if "*" in allowed_scopes or scopes is None:
-            return
-
-        requested_scopes = set(scopes.split())
-
-        if not allowed_scopes.issuperset(requested_scopes):
-            raise ValidationError(
-                "The current user account (%s) does not have the requested scopes. Requested: %s, Allowed: %s"
-                % (current_user.email, requested_scopes, allowed_scopes)
-            )
+        if existing_client is not None:
+            query = query.filter(OAuth2Client.id != existing_client.id)
+        used = sum(self._client_capacity(client) for client in query.all())
+        if used + requested > quota:
+            raise ValidationError("Owner credential quota is exhausted")
 
 
 class ProxyService(GatewayService):
@@ -779,14 +941,9 @@ class LimiterService(GatewayService, Limiter):
         individual_multipliers = getattr(client, "individual_ratelimit_multipliers", None)
 
         if individual_multipliers:
-            multiplier = next(
-                (
-                    value
-                    for pattern, value in individual_multipliers.items()
-                    if re.match(pattern, request.endpoint)
-                ),
-                multiplier,
-            )
+            route_multiplier = individual_multipliers.get(request.endpoint)
+            if route_multiplier is not None:
+                multiplier = max(multiplier, route_multiplier)
 
         if request.endpoint in self._symbolic_ratelimits:
             counts: int = self._symbolic_ratelimits[request.endpoint]["counts"]
@@ -1366,11 +1523,15 @@ class SecurityService(GatewayService, Security):
         user.password = password
         return user
 
-    def change_password(self, user: User, password: str) -> User:
-        """Change a password and commit for non-account-action callers."""
-        user = self.datastore.db.session.merge(user)
+    def change_password(
+        self, user: User, password: str, *, session=None, commit: bool = True
+    ) -> User:
+        """Change a password within either this service's or the caller's transaction."""
+        transaction = session or self.datastore.db.session
+        user = transaction.merge(user)
         self.set_password_in_transaction(user, password)
-        self.datastore.commit()
+        if commit:
+            transaction.commit()
         return user
 
 

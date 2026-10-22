@@ -214,7 +214,7 @@ Account-action rows contain only the bearer digest, target and state binding,
 expiry, and delivery identity; active or terminal outbox JSON never contains a
 bearer or bearer URL.
 
-Apply migrations through `d4c3b2a1908f` and run one or more workers:
+Apply migrations through the current head `e5f6a7b8c9d0` and run one or more workers:
 
 ```bash
 apigateway notifications work
@@ -350,3 +350,78 @@ sessions.
 Responses from reset, login, change-password, change-email, verification,
 CSRF, bootstrap, and personal-token endpoints carry `Cache-Control: no-store`
 and `Pragma: no-cache`, including error responses.
+
+## OAuth credential issuance
+
+OAuth credentials are issued only by the `AuthService` policy transaction. It
+locks the explicit owner row, resolves defaults before checking the owner's
+allowed scopes, applies quota and database-cap policy, rotates the client/token,
+and commits or rolls back the complete operation. Owner quota `None` uses
+`AUTH_SERVICE_DEFAULT_OWNER_QUOTA`, `0` suspends issuance, `-1` is unlimited,
+and every other negative value is invalid. Client capacity is the maximum of
+its positive finite base multiplier and all applicable per-route capacities.
+Per-route keys are exact registered Flask endpoint names; regular expressions,
+unknown endpoints, zero, negative, NaN, and infinity are rejected.
+
+Credential-changing requests are CSRF-protected POSTs:
+
+- `POST /accounts/bootstrap` creates or rotates a session-bound browser
+  credential. Anonymous credentials use the configured bootstrap defaults,
+  expire within 24 hours, are bound to a non-secret browser identifier, and
+  are subject to per-source, global Redis, and finite database limits.
+- `POST /accounts/user/token` creates or rotates the logged-in user's personal
+  credential, with a maximum relative lifetime of 30 days.
+- The corresponding GET endpoints return metadata only. They never return an
+  access token or any other secret. Bearer-only requests cannot inspect or
+  rotate browser or personal credentials.
+
+Issuance responses return the raw access token once and carry
+`Cache-Control: no-store` and `Pragma: no-cache`. No refresh token or client
+secret is issued. The database stores only a version-1 HMAC-SHA-256 digest,
+the digest version, and its key ID.
+
+Configure `ACCESS_TOKEN_HMAC_KEYS` as a JSON object mapping stable key IDs to
+independent random values of at least 32 bytes, and set
+`ACCESS_TOKEN_HMAC_ACTIVE_KEY_ID` to one key in that object. To rotate, deploy
+the new key in the map first, make it active, allow the previous key only for
+the longest remaining token lifetime, then remove it. Removing a prior key
+immediately rejects credentials signed by it. Key material must not be reused
+for Flask sessions, account actions, or any other signing purpose.
+
+`PERSONAL_TOKEN_EXPIRES` defaults to 30 days and cannot exceed 30 days;
+`BOOTSTRAP_TOKEN_EXPIRES` defaults to 24 hours and cannot exceed 24 hours.
+`ANONYMOUS_CREDENTIAL_DATABASE_CAP`,
+`ANONYMOUS_ISSUANCE_SOURCE_LIMIT`, and
+`ANONYMOUS_ISSUANCE_GLOBAL_LIMIT` must all be finite positive settings.
+
+The operator generator uses the same transaction and requires an explicit
+output channel. `--output -` writes only the raw token to stdout; a path creates
+a new mode-0600 file containing only that token. It cannot create users or
+bypass scope, quota, route, or expiry policy.
+
+Deploy in this order: configure the complete HMAC key ring on application and
+operator jobs; stop old issuers; give the migration job only its dedicated
+PostgreSQL URI; upgrade Alembic to `e5f6a7b8c9d0`; then start the new
+application. The migration intentionally deletes every legacy
+plaintext access token, drops refresh-token/client-secret storage, deletes
+unbound legacy anonymous clients, and clears legacy route multiplier maps that
+may contain regular expressions. Users and operators must issue new
+credentials. Downgrade does not recreate or recover secrets.
+
+Anonymous issuance admission is authoritative in Redis: one Lua operation
+increments the source and global fixed-window counters together. A limit
+exhaustion returns HTTP 429; any Redis failure returns HTTP 503 and never falls
+back to process-local counters. Production `REDIS_SERVICE_URL` and
+`LIMITER_SERVICE_STORAGE_URI` must use `redis://` or `rediss://`.
+
+The gateway rejects query parameters named `access_token`, `token`,
+`refresh_token`, or `client_secret`, case-insensitively, before proxy
+forwarding. Proxy and Gunicorn access logs record endpoint/path information
+without complete URLs or query strings.
+
+Alembic reads only the dedicated, validated PostgreSQL
+`SQLALCHEMY_DATABASE_URI`; migration jobs do not initialize the Flask
+application or require its unrelated signing and mail configuration. The OAuth
+migration downgrade first deletes keyed token digests, then restores nullable
+legacy compatibility columns empty so older schema downgrades can run without
+recreating credential values.

@@ -43,6 +43,18 @@ def valid_runtime_config(**overrides):
         "HTTPS_ENFORCEMENT": True,
         "TRUSTED_PROXY_HOPS": 0,
         "SECURITY_SERVICE_ACCOUNT_ACTION_TOKEN_EXPIRES": 24 * 60 * 60,
+        "ACCESS_TOKEN_HMAC_ACTIVE_KEY_ID": "current",
+        "ACCESS_TOKEN_HMAC_KEYS": {
+            "current": "oauth-access-token-key-32-bytes-minimum"
+        },
+        "BOOTSTRAP_TOKEN_EXPIRES": 24 * 60 * 60,
+        "PERSONAL_TOKEN_EXPIRES": 30 * 24 * 60 * 60,
+        "AUTH_SERVICE_DEFAULT_OWNER_QUOTA": 2.0,
+        "ANONYMOUS_CREDENTIAL_DATABASE_CAP": 10000,
+        "ANONYMOUS_ISSUANCE_SOURCE_LIMIT": "10/3600 second",
+        "ANONYMOUS_ISSUANCE_GLOBAL_LIMIT": "1000/3600 second",
+        "REDIS_SERVICE_URL": "redis://redis.example:6379/0",
+        "LIMITER_SERVICE_STORAGE_URI": "rediss://redis.example:6379/1",
     }
     config.update(overrides)
     return config
@@ -257,6 +269,74 @@ def test_account_action_expiry_is_a_positive_integer(expires):
     assert_invalid(config, "SECURITY_SERVICE_ACCOUNT_ACTION_TOKEN_EXPIRES")
 
 
+@pytest.mark.parametrize(
+    "keys,active,invalid",
+    [
+        (None, None, ("ACCESS_TOKEN_HMAC_KEYS", "ACCESS_TOKEN_HMAC_ACTIVE_KEY_ID")),
+        ({}, "current", ("ACCESS_TOKEN_HMAC_KEYS", "ACCESS_TOKEN_HMAC_ACTIVE_KEY_ID")),
+        (
+            {"current": "short"},
+            "current",
+            ("ACCESS_TOKEN_HMAC_KEYS", "ACCESS_TOKEN_HMAC_ACTIVE_KEY_ID"),
+        ),
+        (
+            {"bad id": "oauth-access-token-key-32-bytes-minimum"},
+            "bad id",
+            ("ACCESS_TOKEN_HMAC_KEYS", "ACCESS_TOKEN_HMAC_ACTIVE_KEY_ID"),
+        ),
+        (
+            {"current": "oauth-access-token-key-32-bytes-minimum"},
+            "missing",
+            ("ACCESS_TOKEN_HMAC_ACTIVE_KEY_ID",),
+        ),
+    ],
+)
+def test_access_token_hmac_keyring_fails_closed(keys, active, invalid):
+    config = valid_runtime_config(
+        ACCESS_TOKEN_HMAC_KEYS=keys,
+        ACCESS_TOKEN_HMAC_ACTIVE_KEY_ID=active,
+    )
+    assert_invalid(config, *invalid)
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("BOOTSTRAP_TOKEN_EXPIRES", 86401),
+        ("PERSONAL_TOKEN_EXPIRES", 30 * 86400 + 1),
+        ("ANONYMOUS_CREDENTIAL_DATABASE_CAP", 0),
+        ("ANONYMOUS_ISSUANCE_SOURCE_LIMIT", "inf/second"),
+        ("ANONYMOUS_ISSUANCE_GLOBAL_LIMIT", "0/1 second"),
+    ],
+)
+def test_oauth_issuance_configuration_is_bounded(key, value):
+    config = valid_runtime_config(**{key: value})
+    assert_invalid(config, key)
+
+
+@pytest.mark.parametrize(
+    "collision_key",
+    [
+        "SECRET_KEY",
+        "SECURITY_SERVICE_SECRET_KEY",
+        "SECURITY_SERVICE_VERIFY_PASSWORD_SALT",
+        "SECURITY_SERVICE_VERIFY_EMAIL_SALT",
+    ],
+)
+def test_access_token_hmac_keys_cannot_reuse_other_signing_material(collision_key):
+    config = valid_runtime_config()
+    config["ACCESS_TOKEN_HMAC_KEYS"] = {"current": config[collision_key]}
+    assert_invalid(config, "ACCESS_TOKEN_HMAC_KEYS")
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["REDIS_SERVICE_URL", "LIMITER_SERVICE_STORAGE_URI"],
+)
+@pytest.mark.parametrize("value", ["memory://", "http://redis.example", "", None])
+def test_authoritative_redis_configuration_rejects_non_redis_backends(key, value):
+    config = valid_runtime_config(**{key: value})
+    assert_invalid(config, key)
 def test_attacker_shadow_host_is_rejected_before_route(app):
     response = app.test_client().get(
         "/accounts/status",
@@ -285,7 +365,8 @@ def test_testing_without_explicit_bypass_calls_recaptcha(app, monkeypatch):
     post.assert_called_once()
 
 
-def test_cookie_and_cors_runtime_policy(app):
+def test_cookie_and_cors_runtime_policy(app, monkeypatch):
+    monkeypatch.setitem(app.config, "SESSION_COOKIE_SECURE", True)
     client = app.test_client()
     response = client.get(
         "/not-found",

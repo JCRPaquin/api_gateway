@@ -37,4 +37,4 @@ USER 10001:10001
 
 EXPOSE 8181
 
-CMD ["gunicorn", "--bind=0.0.0.0:8181", "--access-logfile=-", "--error-logfile=-", "wsgi:application"]
+CMD ["gunicorn", "--bind=0.0.0.0:8181", "--access-logfile=-", "--access-logformat=%(h)s %(t)s \"%(m)s %(U)s %(H)s\" %(s)s %(b)s", "--error-logfile=-", "wsgi:application"]

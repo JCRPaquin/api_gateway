@@ -65,34 +65,28 @@ class UserSchema(SQLAlchemyAutoSchema):
 
 
 @dataclass
-class BootstrapGetRequestSchema:
+class CredentialIssuanceRequestSchema:
     scope: str = field(default=None)
-    ratelimit: float = field(
-        default=1.0, metadata={"validate": marshmallow.validate.Range(min=0.0)}
-    )
-    create_new: bool = field(default=False)
-    redirect_uri: str = field(default=None)
+    ratelimit: float = field(default=1.0)
     client_name: str = field(default=None)
-    expires: datetime = field(default=datetime(2050, 1, 1))
+    expires_in: int = field(default=None)
     individual_ratelimits: dict = field(default=None)
 
 
 @dataclass
-class BootstrapGetResponseSchema:
-    access_token: str = field(default=None)
-    refresh_token: str = field(default=None)
-    expires_at: str = field(default=None)
+class CredentialResponseSchema:
+    expires_at: int = field(default=None)
     token_type: str = field(default="Bearer")
     username: str = field(default=None)
     scopes: List[str] = field(default_factory=list)
     anonymous: bool = field(default=None)
     client_id: str = field(default=None)
-    client_secret: str = field(default=None)
     ratelimit: float = field(default=None)
     client_name: str = field(default=None)
     individual_ratelimits: dict = field(default=None)
     given_name: str = field(default=None)
     family_name: str = field(default=None)
+    access_token: str = field(default=None)
 
 
 @dataclass
@@ -199,17 +193,14 @@ class ClearLimitRequestSchema:
 
 
 @dataclass
-class PersonalTokenViewGetResponseSchema:
-    access_token: str = field(default=None)
-    refresh_token: str = field(default=None)
-    expires_at: str = field(default=None)
+class PersonalTokenResponseSchema:
+    expires_at: int = field(default=None)
     token_type: str = field(default="Bearer")
     scopes: List[str] = field(default_factory=list)
     username: str = field(default=None)
-    anonymous: bool = field(default=None)
     client_id: str = field(default=None)
     user_id: str = field(default=None)
-
+    access_token: str = field(default=None)
 
 def validate_public_email(email: str) -> str:
     return PublicEmailValidator()(email)
@@ -405,8 +396,8 @@ def validate_feedback_payload(data: dict, forms_origin: str, bbb_origin: str) ->
     return payload
 
 
-bootstrap_request = marshmallow_dataclass.class_schema(BootstrapGetRequestSchema)()
-bootstrap_response = marshmallow_dataclass.class_schema(BootstrapGetResponseSchema)()
+bootstrap_request = marshmallow_dataclass.class_schema(CredentialIssuanceRequestSchema)()
+bootstrap_response = marshmallow_dataclass.class_schema(CredentialResponseSchema)()
 user_auth_request = marshmallow_dataclass.class_schema(UserAuthPostRequestSchema)()
 user_register_request = marshmallow_dataclass.class_schema(UserRegisterPostRequestSchema)()
 change_password_request = marshmallow_dataclass.class_schema(ChangePasswordRequestSchema)()
@@ -422,4 +413,4 @@ account_action_token_request = marshmallow_dataclass.class_schema(
 reset_password_request = marshmallow_dataclass.class_schema(ResetPasswordRequestSchema)()
 clear_cache_request = marshmallow_dataclass.class_schema(ClearCacheRequestSchema)()
 clear_limit_request = marshmallow_dataclass.class_schema(ClearLimitRequestSchema)()
-personal_token_response = marshmallow_dataclass.class_schema(PersonalTokenViewGetResponseSchema)()
+personal_token_response = marshmallow_dataclass.class_schema(PersonalTokenResponseSchema)()
