@@ -214,7 +214,7 @@ Account-action rows contain only the bearer digest, target and state binding,
 expiry, and delivery identity; active or terminal outbox JSON never contains a
 bearer or bearer URL.
 
-Apply migrations through the current head `e5f6a7b8c9d0` and run one or more workers:
+Apply migrations through the current head `7d1c4a9e2b31` and run one or more workers:
 
 ```bash
 apigateway notifications work
@@ -401,12 +401,13 @@ bypass scope, quota, route, or expiry policy.
 
 Deploy in this order: configure the complete HMAC key ring on application and
 operator jobs; stop old issuers; give the migration job only its dedicated
-PostgreSQL URI; upgrade Alembic to `e5f6a7b8c9d0`; then start the new
-application. The migration intentionally deletes every legacy
-plaintext access token, drops refresh-token/client-secret storage, deletes
-unbound legacy anonymous clients, and clears legacy route multiplier maps that
-may contain regular expressions. Users and operators must issue new
-credentials. Downgrade does not recreate or recover secrets.
+PostgreSQL URI; upgrade Alembic through `e5f6a7b8c9d0` to the single head
+`7d1c4a9e2b31`; then start the new application. The OAuth migration
+intentionally deletes every legacy plaintext access token, drops
+refresh-token/client-secret storage, deletes unbound legacy anonymous clients,
+and clears legacy route multiplier maps that may contain regular expressions.
+Users and operators must issue new credentials. Downgrade does not recreate or
+recover secrets.
 
 Anonymous issuance admission is authoritative in Redis: one Lua operation
 increments the source and global fixed-window counters together. A limit
@@ -425,3 +426,56 @@ application or require its unrelated signing and mail configuration. The OAuth
 migration downgrade first deletes keyed token digests, then restores nullable
 legacy compatibility columns empty so older schema downgrades can run without
 recreating credential values.
+
+## Operational cleanup and recoverable operator delivery
+
+Bearer authentication persists a throttled UTC `last_activity` update before the
+protected request runs. `OAUTH2_ACTIVITY_WRITE_INTERVAL` controls the write
+interval and defaults to five minutes. Revision `7d1c4a9e2b31` backfills active
+clients at deployment, so client cleanup must not start until that revision and
+the activity-recording code are both deployed.
+
+Cleanup commands require interactive confirmation unless `--yes` is supplied.
+Use the same selection arguments with `--dry-run` before unattended deletion:
+
+```bash
+apigateway cleanup clients --timedelta days=90 --ratelimit 1 --dry-run
+apigateway cleanup clients --timedelta days=90 --ratelimit 1 --yes
+apigateway cleanup users --timedelta hours=24 --yes
+apigateway cleanup tokens --yes
+```
+
+Retention accepts one positive finite unit/value pair such as `hours=24` or
+`days=90`; client rate-limit thresholds must be finite and nonnegative. Cleanup
+selects at most 1,000 IDs per transaction and rechecks every predicate during
+deletion. Expired-token cleanup deletes child rows only and leaves
+pending-delivery rows for explicit recovery. Client cleanup preserves clients
+with active or pending credentials. Stale-user cleanup does not delete the
+anonymous bootstrap owner or any user that still owns OAuth clients.
+
+`scripts/generate_oauth_client.py` continues to use the centralized issuance
+policy. `--user-email` must be an email address; it is canonicalized and
+resolved to exactly one existing user before the immutable owner identifier is
+passed to issuance. A `fs_uniquifier` is not accepted as email input.
+`--output -` writes only the newly issued raw bearer to stdout. A file path
+creates a mode-`0600` file containing only the raw bearer; stdout then contains
+non-secret delivery status. The database stores only the keyed HMAC digest and
+safe delivery metadata, never the raw bearer, refresh tokens, or client secrets.
+
+For file delivery, the generator serializes each normalized destination with a
+non-secret, mode-`0600` `.oauth-lock-*` entry, then writes and fsyncs a
+same-directory pending file before the issuance transaction commits. The
+committed token is marked pending with its normalized destination path.
+Publication uses an atomic hard link, verifies the inode, mode, ownership, link
+count, and digest, fsyncs the directory, and only then clears pending state.
+Rerunning the same canonical-owner request recovers a crash after commit or
+publication, including a successful issuance commit whose acknowledgement was
+lost. Once a pending raw file has been durably prepared, any issuance error
+retains that file. If a later authoritative query finds the matching pending
+row, the retry completes delivery. If no row is visible, the retry fails closed
+and leaves the file untouched because an unresolved backend transaction may
+still commit. Manual remediation may remove the pending file only after
+verifying both that no matching digest or pending row exists and that no
+backend transaction can still commit. Pre-prepare failures create no durable
+pending bearer. A different request, path, conflicting content, symlink,
+nonregular file, unsafe mode, or extra link also fails closed.

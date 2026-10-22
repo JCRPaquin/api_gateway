@@ -160,6 +160,13 @@ class OAuth2Token(base_model, OAuth2TokenMixin):
         sa.CheckConstraint(
             "token_digest_version = 1", name="ck_oauth2token_digest_version"
         ),
+        sa.CheckConstraint(
+            (
+                "(credential_delivery_pending AND credential_delivery_path IS NOT NULL) "
+                "OR (NOT credential_delivery_pending AND credential_delivery_path IS NULL)"
+            ),
+            name="ck_oauth2token_delivery_state",
+        ),
         sa.UniqueConstraint(
             "token_key_id",
             "access_token",
@@ -193,6 +200,10 @@ class OAuth2Token(base_model, OAuth2TokenMixin):
     is_personal = sa.Column(sa.Boolean, default=False, index=True)
     is_internal = sa.Column(sa.Boolean, default=False)
     expires_in = sa.Column(sa.BigInteger, nullable=False)
+    credential_delivery_pending = sa.Column(
+        sa.Boolean, nullable=False, default=False, server_default=sa.false()
+    )
+    credential_delivery_path = sa.Column(sa.Text, nullable=True)
 
     def expires_at(self):
         if not self.expires_in:

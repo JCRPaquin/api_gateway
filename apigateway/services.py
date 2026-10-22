@@ -40,6 +40,7 @@ from apigateway import extensions
 from apigateway.domains import canonicalize_email
 from apigateway.exceptions import (
     AccountActionTokenError,
+    NoClientError,
     ValidationError,
 )
 from apigateway.models import (
@@ -51,6 +52,42 @@ from apigateway.models import (
     User,
 )
 from apigateway.utils import GatewayResourceProtector, ProxyView
+
+def normalize_scopes(scopes):
+    """Return scopes in stable order, with whitespace and duplicates removed."""
+    normalized = []
+    seen = set()
+    for value in scopes or []:
+        for scope in value.split():
+            if scope not in seen:
+                seen.add(scope)
+                normalized.append(scope)
+    return normalized
+
+
+def validate_user_scopes(user: User, scopes):
+    """Validate and normalize requested scopes against a user's scope policy."""
+    requested_scopes = normalize_scopes(scopes)
+    allowed_scopes = set(user.allowed_scopes)
+    if "*" not in allowed_scopes and not allowed_scopes.issuperset(requested_scopes):
+        raise ValidationError(
+            "The user account (%s) does not have the requested scopes. Requested: %s, Allowed: %s"
+            % (user.email, set(requested_scopes), allowed_scopes)
+        )
+    return requested_scopes
+
+
+def validate_client_scopes(client: OAuth2Client, scopes):
+    """Validate requested scopes against an existing client's authorization envelope."""
+    requested_scopes = normalize_scopes(scopes)
+    authorized_scopes = set((client.scope or "").split())
+    if "*" not in authorized_scopes and not authorized_scopes.issuperset(requested_scopes):
+        raise ValidationError(
+            "The OAuth client does not authorize the requested scopes. Requested: %s, Authorized: %s"
+            % (set(requested_scopes), authorized_scopes)
+        )
+    return requested_scopes
+
 
 
 
@@ -172,21 +209,26 @@ class AuthService(GatewayService):
         token_authenticated.connect(self._token_authenticated, weak=False)
 
     def _token_authenticated(self, sender, token: OAuth2Token = None, **kwargs):
-        """Adds the X-api-uid and X-Access-Modality headers for token-authenticated requests."""
-        if token is None or not token.user:
+        """Record bearer activity durably and add authenticated request headers."""
+        if token is None:
             return
 
+        user = token.user
+        if user is None:
+            extensions.db.session.rollback()
+            raise NoClientError("OAuth token has no associated owner")
+        client = self._record_bearer_activity(token)
+
+        user_id = user.id
         headers = Headers(request.headers.items())
-        headers.add_header("X-api-uid", token.user.id)
+        headers.add_header("X-api-uid", user_id)
 
         # The only differentiator between API and UI clients is the client_name
-        client = token.client
-        client_name = client.client_name if client is not None else None
+        client_name = client.client_name
         modality = "api" if client_name and "API" in client_name else "ui"
 
         g.access_modality = modality
         headers[AuthService.MODALITY_HEADER] = modality
-
         request.headers = headers
 
     def digest_access_token(self, raw_token: str, key_id: str = None) -> str:
@@ -198,6 +240,68 @@ class AuthService(GatewayService):
         return hmac.new(
             key, ("v1:" + raw_token).encode("utf-8"), hashlib.sha256
         ).hexdigest()
+
+    def _record_bearer_activity(self, token: OAuth2Token) -> OAuth2Client:
+        """Persist throttled bearer activity before the protected view runs."""
+        if not isinstance(token, OAuth2Token):
+            client = getattr(token, "client", None)
+            if client is None:
+                raise NoClientError("OAuth token has no associated client")
+            return client
+        if token.client_id is None:
+            extensions.db.session.rollback()
+            raise NoClientError("OAuth token has no associated client")
+
+        session = extensions.db.session
+        client = (
+            session.query(OAuth2Client)
+            .filter(OAuth2Client.id == token.client_id)
+            .one_or_none()
+        )
+        if client is None:
+            session.rollback()
+            raise NoClientError("OAuth client no longer exists")
+
+        try:
+            interval = float(
+                self._app.config.get("OAUTH2_ACTIVITY_WRITE_INTERVAL", 300)
+            )
+        except (TypeError, ValueError):
+            interval = 0.0
+        if not math.isfinite(interval) or interval < 0:
+            interval = 0.0
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        stale_before = now - timedelta(seconds=interval)
+
+        try:
+            updated = (
+                session.query(OAuth2Client)
+                .filter(
+                    OAuth2Client.id == token.client_id,
+                    or_(
+                        OAuth2Client.last_activity.is_(None),
+                        OAuth2Client.last_activity <= stale_before,
+                    ),
+                )
+                .update(
+                    {OAuth2Client.last_activity: now},
+                    synchronize_session=False,
+                )
+            )
+            if updated == 0:
+                client = (
+                    session.query(OAuth2Client)
+                    .filter(OAuth2Client.id == token.client_id)
+                    .populate_existing()
+                    .one_or_none()
+                )
+                if client is None:
+                    raise NoClientError("OAuth client no longer exists")
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        return client
 
     def lookup_access_token(self, raw_token: str):
         candidates = [
@@ -310,6 +414,8 @@ return 1
         individual_ratelimit_multipliers: dict = None,
         binding_digest: str = None,
         rotate: bool = True,
+        credential_delivery_path: str = None,
+        prepare_delivery: Callable = None,
     ) -> IssuedCredential:
         """Create or rotate a bearer credential in one locked transaction.
 
@@ -336,6 +442,18 @@ return 1
                 purpose,
                 binding_digest=binding_digest,
             )
+            if existing is not None and (
+                db_session.query(OAuth2Token.id)
+                .filter_by(
+                    client_id=existing.id,
+                    credential_delivery_pending=True,
+                )
+                .first()
+                is not None
+            ):
+                raise ValidationError(
+                    "Credential delivery is pending and must be recovered first"
+                )
             if existing is not None and not rotate:
                 raise ValidationError("An active credential already exists")
 
@@ -355,7 +473,7 @@ return 1
                     user_id=locked_owner.get_id(),
                     ratelimit_multiplier=base_capacity,
                     individual_ratelimit_multipliers=route_capacities or None,
-                    last_activity=datetime.now(),
+                    last_activity=datetime.now(timezone.utc).replace(tzinfo=None),
                     credential_purpose=purpose,
                     binding_digest=binding_digest,
                 )
@@ -375,7 +493,7 @@ return 1
                 client = existing
                 client.ratelimit_multiplier = base_capacity
                 client.individual_ratelimit_multipliers = route_capacities or None
-                client.last_activity = datetime.now()
+                client.last_activity = datetime.now(timezone.utc).replace(tzinfo=None)
                 client.set_client_metadata(
                     {
                         "client_name": client_name or client.client_name,
@@ -399,10 +517,20 @@ return 1
                 expires_in=lifetime,
                 credential_purpose=purpose,
                 is_personal=purpose in {"personal", "operator"},
+                credential_delivery_pending=credential_delivery_path is not None,
+                credential_delivery_path=credential_delivery_path,
             )
+            if (credential_delivery_path is None) != (prepare_delivery is None):
+                raise ValidationError(
+                    "Credential delivery path and preparation callback are both required"
+                )
             db_session.add(token)
+            db_session.flush()
+            issued = IssuedCredential(client, token, raw_token)
+            if prepare_delivery is not None:
+                prepare_delivery(issued)
             db_session.commit()
-            return IssuedCredential(client, token, raw_token)
+            return issued
         except Exception:
             db_session.rollback()
             raise
@@ -415,9 +543,7 @@ return 1
             else:
                 query = query.filter(User.fs_uniquifier == owner.get_id())
         elif isinstance(owner, str):
-            query = query.filter(
-                or_(User.fs_uniquifier == owner, User.email == owner)
-            )
+            query = query.filter(User.fs_uniquifier == owner)
         else:
             raise ValidationError("A valid credential owner is required")
         locked_owner = query.with_for_update().one_or_none()

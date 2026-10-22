@@ -182,11 +182,15 @@ class BootstrapView(Resource):
             abort(401)
         params = schemas.bootstrap_request.load(_account_body())
         login_anonymous_owner = not current_user.is_authenticated
-        owner = (
-            current_app.config["ANONYMOUS_BOOTSTRAP_USER_EMAIL"]
-            if login_anonymous_owner
-            else current_user.get_id()
-        )
+        if login_anonymous_owner:
+            anonymous_owner = User.query.filter_by(
+                email=current_app.config["ANONYMOUS_BOOTSTRAP_USER_EMAIL"]
+            ).one_or_none()
+            if anonymous_owner is None:
+                abort(500, message="Anonymous credential owner is unavailable")
+            owner = anonymous_owner.fs_uniquifier
+        else:
+            owner = current_user.get_id()
         anonymous = login_anonymous_owner or current_user.is_anonymous_bootstrap_user
 
         if anonymous:

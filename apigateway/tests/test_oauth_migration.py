@@ -120,13 +120,24 @@ def test_oauth_migration_invalidates_legacy_state_and_downgrades_empty(monkeypat
         assert "client_secret_expires_at" not in client_columns
         assert "refresh_token" not in token_columns
         assert "refresh_token_revoked_at" not in token_columns
-        assert {"token_key_id", "token_digest_version", "credential_purpose"} <= token_columns
+        assert {
+            "token_key_id",
+            "token_digest_version",
+            "credential_purpose",
+            "credential_delivery_pending",
+            "credential_delivery_path",
+        } <= token_columns
         assert {"credential_purpose", "binding_digest"} <= client_columns
+        assert next(
+            column
+            for column in inspector.get_columns("oauth2token")
+            if column["name"] == "access_token"
+        )["nullable"] is False
         with engine.connect() as connection:
             assert connection.scalar(sa.text("SELECT count(*) FROM oauth2token")) == 0
             assert connection.scalar(
                 sa.text("SELECT version_num FROM alembic_version")
-            ) == "e5f6a7b8c9d0"
+            ) == "7d1c4a9e2b31"
             assert connection.scalar(
                 sa.text(
                     "SELECT count(*) FROM oauth2client "
@@ -144,6 +155,11 @@ def test_oauth_migration_invalidates_legacy_state_and_downgrades_empty(monkeypat
             for constraint in inspector.get_check_constraints("oauth2client")
         }
         assert "ck_oauth2client_anonymous_binding" in constraints
+        token_constraints = {
+            constraint["name"]
+            for constraint in inspector.get_check_constraints("oauth2token")
+        }
+        assert "ck_oauth2token_delivery_state" in token_constraints
         assert any(
             index["name"] == "uq_oauth2client_active_personal_owner"
             and index["unique"]

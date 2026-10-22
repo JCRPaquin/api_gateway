@@ -64,10 +64,13 @@ def app(request):
 
 @pytest.fixture(autouse=True)
 def test_db(app):
+    app.db.session.remove()
     base_model.metadata.create_all(bind=app.db.engine)
-    yield
-    base_model.metadata.drop_all(bind=app.db.engine)
-
+    try:
+        yield
+    finally:
+        app.db.session.remove()
+        base_model.metadata.drop_all(bind=app.db.engine)
 
 @pytest.fixture()
 def mock_anon_user():

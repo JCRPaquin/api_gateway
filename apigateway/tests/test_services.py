@@ -1,3 +1,4 @@
+import datetime
 import hashlib
 
 from unittest.mock import MagicMock, PropertyMock, call, patch
@@ -5,6 +6,7 @@ from unittest.mock import MagicMock, PropertyMock, call, patch
 import pytest
 from flask import g, request
 
+from apigateway.exceptions import NoClientError
 from apigateway.models import OAuth2Client, OAuth2Token, User
 from apigateway.services import GatewayService
 
@@ -159,20 +161,31 @@ class TestAuthService:
 
             assert "X-Access-Modality" not in request.headers
 
-    def test_modality_header_real_api_client(self, app, mock_regular_user):
-        # Exercise the real relationship/metadata path (not a MagicMock): a token
-        # whose OAuth2Client metadata names it an API client resolves to "api".
-        mock_regular_user.is_authenticated = False
-
-        client = OAuth2Client(user_id=mock_regular_user.get_id(), client_id="real_api_client")
-        client.set_client_metadata({"client_name": "ADS API client"})
-        token = OAuth2Token(
-            user_id=mock_regular_user.get_id(),
-            client_id=client.id,
-            access_token="real_api_token",
+    def test_modality_header_real_api_client(self, app):
+        user = User(
+            email="real-api@example.test",
+            fs_uniquifier="real-api-user",
+            active=True,
         )
-        token.client = client
-        token.user = mock_regular_user
+        client = OAuth2Client(
+            user_id=user.fs_uniquifier,
+            client_id="real-api-client",
+            credential_purpose="operator",
+        )
+        client.set_client_metadata({"client_name": "ADS API client", "scope": "api"})
+        app.db.session.add_all([user, client])
+        app.db.session.flush()
+        token = OAuth2Token(
+            user_id=user.fs_uniquifier,
+            client_id=client.id,
+            access_token=hashlib.sha256(b"real-api-token").hexdigest(),
+            token_key_id=app.config["ACCESS_TOKEN_HMAC_ACTIVE_KEY_ID"],
+            token_digest_version=1,
+            credential_purpose="operator",
+            expires_in=3600,
+        )
+        app.db.session.add(token)
+        app.db.session.commit()
 
         with app.test_request_context("/test_modality_real_api"):
             g.pop("access_modality", None)
@@ -180,6 +193,87 @@ class TestAuthService:
 
             assert request.headers["X-Access-Modality"] == "api"
             assert len(request.headers.getlist("X-Access-Modality")) == 1
+
+    def test_bearer_activity_rejects_clientless_token(self, app):
+        user = User(
+            email="clientless@example.test",
+            fs_uniquifier="clientless-user",
+            active=True,
+        )
+        app.db.session.add(user)
+        app.db.session.commit()
+        token = OAuth2Token(
+            user_id=user.fs_uniquifier,
+            client_id=None,
+            access_token="clientless-access",
+        )
+        token.user = user
+
+        with app.test_request_context("/clientless"):
+            with pytest.raises(NoClientError):
+                app.auth_service._token_authenticated(sender=None, token=token)
+
+    def test_bearer_activity_is_durable_and_throttled(self, app):
+        user = User(
+            email="activity@example.test",
+            fs_uniquifier="activity-user",
+            active=True,
+        )
+        client = OAuth2Client(
+            user_id=user.fs_uniquifier,
+            client_id="activity-client",
+            credential_purpose="operator",
+            last_activity=datetime.datetime.utcnow() - datetime.timedelta(days=1),
+        )
+        client.set_client_metadata({"client_name": "ADS API client", "scope": "api"})
+        app.db.session.add_all([user, client])
+        app.db.session.flush()
+        token = OAuth2Token(
+            user_id=user.fs_uniquifier,
+            client_id=client.id,
+            token_type="Bearer",
+            access_token=hashlib.sha256(b"activity-access").hexdigest(),
+            token_key_id=app.config["ACCESS_TOKEN_HMAC_ACTIVE_KEY_ID"],
+            token_digest_version=1,
+            credential_purpose="operator",
+            scope="api",
+            expires_in=3600,
+        )
+        app.db.session.add(token)
+        app.db.session.commit()
+
+        with app.test_request_context("/activity"):
+            app.auth_service._token_authenticated(sender=None, token=token)
+
+        app.db.session.refresh(client)
+        first_activity = client.last_activity
+        assert first_activity > datetime.datetime.utcnow() - datetime.timedelta(minutes=1)
+
+        with app.test_request_context("/activity-again"):
+            app.auth_service._token_authenticated(sender=None, token=token)
+
+        app.db.session.refresh(client)
+        assert client.last_activity == first_activity
+
+    def test_bearer_activity_rejects_disappeared_client(self, app):
+        user = User(
+            email="missing-client@example.test",
+            fs_uniquifier="missing-client-user",
+            active=True,
+        )
+        app.db.session.add(user)
+        app.db.session.commit()
+        token = OAuth2Token(
+            user_id=user.fs_uniquifier,
+            client_id=999999,
+            access_token="missing-client-access",
+        )
+        token.user = user
+
+        with app.test_request_context("/missing-client"):
+            with pytest.raises(NoClientError):
+                app.auth_service._token_authenticated(sender=None, token=token)
+
 
 
 class TestProxyService:

@@ -226,7 +226,8 @@ def test_anonymous_post_requires_csrf_before_redis_admission(app, monkeypatch):
 
 def test_anonymous_post_is_session_bound_bounded_and_metadata_only(app, monkeypatch):
     with app.app_context():
-        _user(app, "anonymous-route", anonymous=True, scopes="")
+        anonymous_owner = _user(app, "anonymous-route", anonymous=True, scopes="")
+        owner_id = anonymous_owner.fs_uniquifier
     browser, response = _anonymous_browser(
         app, monkeypatch, lambda *args, **kwargs: 1
     )
@@ -248,6 +249,11 @@ def test_anonymous_post_is_session_bound_bounded_and_metadata_only(app, monkeypa
         base_url="https://localhost",
     )
     assert rejected.status_code == 401
+    with app.app_context():
+        token = app.db.session.query(OAuth2Token).one()
+        assert token.user_id == owner_id
+        assert token.client.user_id == owner_id
+        assert token.user_id != app.config["ANONYMOUS_BOOTSTRAP_USER_EMAIL"]
 
 
 @pytest.mark.parametrize("redis_behavior,status", [("exhausted", 429), ("error", 503)])
