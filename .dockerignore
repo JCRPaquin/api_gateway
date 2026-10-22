@@ -1,0 +1,17 @@
+**
+
+!Dockerfile
+!pyproject.toml
+!uv.lock
+!README.md
+!alembic.ini
+!wsgi.py
+
+!apigateway/
+!apigateway/**
+apigateway/logs/
+apigateway/logs/**
+!migrations/
+!migrations/**
+!scripts/
+!scripts/**

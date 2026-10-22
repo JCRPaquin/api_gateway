@@ -375,7 +375,20 @@ def send_account_registration_attempt_email(email: str):
         ui_url=ui_url,
     )
 
+def normalize_email_domain(domain: str) -> str:
+    """Return the canonical form used for disposable-domain policy checks."""
+    return domain.strip().rstrip(".").lower()
+
+
 def generate_complete_blocklist():
-    with open(os.path.abspath(os.path.join(os.path.dirname(__file__), "disallowed_email_domain_list.conf"))) as f:
-        ads_list = f.readlines()
-    return set(ads_list + list(blocklist))
+    local_blocklist_path = os.path.join(
+        os.path.dirname(__file__), "disallowed_email_domain_list.conf"
+    )
+    with open(local_blocklist_path, encoding="utf-8") as domain_file:
+        domains = list(domain_file) + list(blocklist)
+
+    return {
+        normalized
+        for domain in domains
+        if (normalized := normalize_email_domain(domain))
+    }

@@ -1,44 +1,48 @@
 [project]
 name = "apigateway"
 version = "0.0.1"
-description = "Project description - replace"
+description = "SciX API Gateway"
 authors = [{ name = "Philip Matsson", email = "philip@winterway.eu" }]
 license = { text = "MIT" }
 readme = "README.md"
-repository = "https://github.com/adsabs/api_gateway"
+requires-python = ">=3.12,<3.13"
 classifiers = [
     "Development Status :: 2 - Pre-Alpha",
     "Intended Audience :: Developers",
     "Natural Language :: English",
     "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
     "Topic :: Software Development :: Libraries",
 ]
 
-packages = ["apigateway"]
-
 dependencies = [
-    'adsmutils@git+https://github.com/adsabs/ADSMicroserviceUtils.git@v1.3.0',
-    'authlib==1.2.1',
-    'alembic==1.12.0',
-    'flask-limiter==3.5.1',
-    'flask-marshmallow==0.14.0',
-    'flask-security-too==5.3.3',
-    'marshmallow-dataclass==8.6.0',
-    'marshmallow-sqlalchemy==0.28.2',
-    'portalocker==2.8.2',
-    'redis==5.0.1',
-    'sqlalchemy-utils==0.41.1',
-    'Flask-Caching==2.1.0',
-    'kafka-python==2.0.2',
-    'flask-cors==4.0.0',
-    'flask-talisman==1.1.0',
-    'jsondiff==2.0.0',
-    'sqlalchemy-citext==1.8.0',
-    'opentelemetry-instrumentation-flask==0.51b0',
-    'opentelemetry-sdk==1.30.0',
-    'opentelemetry-exporter-otlp==1.30.0',
-    'opentelemetry-instrumentation-sqlalchemy==0.51b0',
-    'disposable-email-domains==0.0.256'
+    "adsmutils @ https://github.com/adsabs/ADSMicroserviceUtils/archive/8b20e6ea2cbea75bc3ccfa952bd9b5360bd82075.tar.gz",
+    "authlib==1.2.1",
+    "alembic==1.12.0",
+    "flask-limiter==3.5.1",
+    "flask-marshmallow==0.14.0",
+    "flask-security-too==5.3.3",
+    # Runtime-only compatibility for flask-security-too/passlib; Flit remains the sole build backend.
+    "setuptools==80.9.0",
+    "marshmallow-dataclass==8.6.0",
+    "marshmallow-sqlalchemy==0.28.2",
+    "portalocker==2.8.2",
+    "psycopg2-binary==2.9.11",
+    "gunicorn==26.2.0",
+    "redis==5.0.1",
+    "sqlalchemy-utils==0.41.1",
+    "Flask-Caching==2.1.0",
+    "kafka-python==2.3.2",
+    "flask-cors==6.0.0",
+    "flask-talisman==1.1.0",
+    "jsondiff==2.0.0",
+    "sqlalchemy-citext==1.8.0",
+    "opentelemetry-instrumentation-flask==0.66b0",
+    "opentelemetry-sdk==1.45.0",
+    "opentelemetry-exporter-otlp==1.45.0",
+    "opentelemetry-instrumentation-sqlalchemy==0.66b0",
+    "disposable-email-domains==0.0.256",
 ]
 
 [project.urls]
@@ -46,19 +50,21 @@ Source = "https://github.com/adsabs/api_gateway"
 
 [project.optional-dependencies]
 dev = [
-    'black==22.3.0',
-    'flake8==4.0.1',
-    'isort==5.12.0',
-    'pytest==6.2.5',
-    'pyupgrade==2.29.1',
-    'pytest-mock==3.6.1',
-    'pre-commit==2.16.0',
-    'coveralls==3.3.1',
-    'mock==4.0.3',
-    'coverage==6.2',
-    'pytest-cov==3.0.0',
-    'pytest-cookies==0.6.1',
+    "black==26.3.1",
+    "flake8==7.3.0",
+    "isort==7.0.0",
+    "pytest==9.0.3",
+    "pyupgrade==3.21.2",
+    "pytest-mock==3.15.1",
+    "pre-commit==4.5.1",
+    "coveralls==4.0.2",
+    "coverage==7.13.4",
+    "pytest-cov==7.0.0",
 ]
+
+
+[project.scripts]
+apigateway = "apigateway.cli:cli"
 
 [tool.pytest.ini_options]
 addopts = "-v -Wdefault --cov=apigateway"
@@ -79,23 +85,8 @@ profile = "black"
 known_first_party = ["apigateway", "tests"]
 
 [tool.black]
-line-length = 99 # override black's default line-length
+line-length = 99
 
 [build-system]
-requires = [
-    "setuptools",
-    "wheel",
-    "flit_core >=3.2,<4",
-    "ppsetuptools==2.0.2"
-]
+requires = ["flit_core==3.12.0"]
 build-backend = "flit_core.buildapi"
-#build-backend = "setuptools.build_meta"
-
-[project.scripts]
-apigateway = "apigateway.cli:cli"
-
-# see setup.py for explanation of these
-[xsetup.entry_points]
-console_scripts = ["adsingestp=adsingestp.cli:cli"]
-[xsetup]
-scripts = []

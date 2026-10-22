@@ -1,0 +1,30 @@
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: monthly
+      day: monday
+      time: "09:00"
+      timezone: Etc/UTC
+    allow:
+      - dependency-type: direct
+    open-pull-requests-limit: 5
+    groups:
+      disposable-email-policy:
+        patterns:
+          - disposable-email-domains
+      direct-dependencies:
+        patterns:
+          - "*"
+        exclude-patterns:
+          - disposable-email-domains
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+      day: monday
+      time: "09:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 2

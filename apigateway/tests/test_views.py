@@ -12,7 +12,7 @@ from apigateway import views
 from apigateway.email_templates import EmailChangedNotification, VerificationEmail
 from apigateway.models import AnonymousUser, EmailChangeRequest, User
 from apigateway.schemas import bootstrap_response
-from apigateway.utils import ProxyView
+from apigateway.utils import ProxyView, generate_complete_blocklist, normalize_email_domain
 
 
 class TestBootstrapView:
@@ -258,17 +258,26 @@ class TestUserManagementView:
             with pytest.raises(ValidationError):
                 user_management_view.post()
 
-    def test_post_new_user_disposable_email(self, app, user_management_view, new_user_data):
-        new_user_data["email"] = "test@0-mail.com"
+    @pytest.mark.parametrize("domain", ["0-mail.com", "0-MAIL.COM"])
+    def test_post_new_user_disposable_email(
+        self, app, user_management_view, new_user_data, domain
+    ):
+        new_user_data["email"] = f"test@{domain}"
         with app.test_request_context(json=new_user_data):
             _, status_code = user_management_view.post()
             assert status_code == 400
 
-    def test_post_new_user_disposable_email_from_ads_blocklist(self, app, user_management_view, new_user_data):
-        new_user_data["email"] = "test@blobapps.com"
+    def test_post_new_user_disposable_email_from_local_blocklist(
+        self, app, user_management_view, new_user_data
+    ):
+        new_user_data["email"] = "test@BLOBAPPS.COM"
         with app.test_request_context(json=new_user_data):
             _, status_code = user_management_view.post()
             assert status_code == 400
+
+    def test_domain_policy_normalizes_curated_entries(self):
+        assert normalize_email_domain(" BlobApps.COM.\n") == "blobapps.com"
+        assert "blobapps.com" in generate_complete_blocklist()
 
     def test_post_existing_user(self, app, user_management_view, authenticated_user):
         existing_user = {

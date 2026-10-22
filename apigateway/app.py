@@ -1,4 +1,6 @@
-from adsmutils import ADSFlask
+from pathlib import Path
+
+from adsmutils import ADSFlask, load_config
 from authlib.integrations.flask_oauth2 import current_token
 from authlib.integrations.sqla_oauth2 import (
     create_query_client_func,
@@ -25,6 +27,10 @@ from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader, Cons
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
 
+_APP_NAME = __name__
+_PROJECT_ROOT = Path(__file__).resolve().parent
+
+
 def register_extensions(app: Flask):
     """Register extensions.
 
@@ -33,6 +39,7 @@ def register_extensions(app: Flask):
     """
 
     extensions.db.init_app(app)
+    app.db = extensions.db
     extensions.ma.init_app(app)
 
     extensions.cors.init_app(
@@ -218,13 +225,27 @@ def create_app(**config):
     Returns:
         ADSFlask: Application object
     """
+    effective_config = load_config(
+        proj_home=str(_PROJECT_ROOT),
+        app_name=_APP_NAME,
+    )
+    effective_config.update(config)
+    database_uri = effective_config.get("SQLALCHEMY_DATABASE_URI")
+
+    # ADSFlask v2 creates its own Flask-SQLAlchemy extension whenever a
+    # database URI is present. Suppress that initialization so the gateway's
+    # extension, which owns base_model, remains the sole database extension.
+    adsmutils_config = dict(effective_config)
+    adsmutils_config["SQLALCHEMY_DATABASE_URI"] = None
 
     app = ADSFlask(
-        __name__,
+        _APP_NAME,
         static_folder=None,
         template_folder="templates",
-        local_config=config,
+        proj_home=str(_PROJECT_ROOT),
+        local_config=adsmutils_config,
     )
+    app.config["SQLALCHEMY_DATABASE_URI"] = database_uri
 
     # old baggage... Consul used to store keys in hexadecimal form
     # so the production/staging databases both convert that into raw bytes
