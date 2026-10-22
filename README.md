@@ -19,6 +19,25 @@ To run this project, you will need:
 
 Before running the project, you should update the configuration in `config.py`. This file contains settings that are necessary for the proper operation of the application, such as database connection information and secret keys. Make sure to replace the placeholders with the actual values.
 
+#### Kafka request telemetry
+
+Kafka request events are best-effort telemetry. The producer keeps `acks=0` and
+uses `KAFKA_PRODUCER_SERVICE_MAX_BLOCK_MS = 0`, so metadata unavailability,
+buffer pressure, serialization errors, and synchronous send failures cause the
+event to be dropped immediately. They do not delay or alter the HTTP response.
+The request path never waits for delivery or flushes the producer.
+
+Kafka is not included in the Compose stack. If request telemetry is enabled,
+the configured bootstrap brokers must be reachable from the gateway, but must
+not be exposed to untrusted networks. Production brokers must require
+authenticated clients, authorize this gateway only to write its request topic,
+and use encrypted transport. The current producer configuration supplies only
+bootstrap addresses; configure the corresponding Kafka authentication and TLS
+settings before enabling it in such an environment. Broker or network
+availability must not be treated as a requirement for serving API requests,
+because telemetry is intentionally dropped whenever immediate admission is
+not possible.
+
 ### Running the application
 
 To start the application, navigate to the project directory in your terminal and run the following command:

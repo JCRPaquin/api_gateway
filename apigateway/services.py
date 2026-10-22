@@ -1413,36 +1413,39 @@ class KafkaProducerService(GatewayService):
                 ),
                 value_serializer=lambda v: json.dumps(v).encode("utf-8"),
                 request_timeout_ms=self.get_service_config("REQUEST_TIMEOUT_MS", 500),
+                max_block_ms=self.get_service_config("MAX_BLOCK_MS", 0),
                 acks=0,  # Fire and forget. We don't want issues with the broker to affect the Gateway.
             )
-        except Exception as ex:
-            self._logger.error("Could not connect to Kafka: %s", ex)
+        except Exception:
+            self._logger.error("Kafka producer unavailable; request telemetry disabled")
             return None
 
     def _register_hooks(self, app: Flask):
         @app.after_request
         def _after_request_hook(response: Response):
-            if self._producer is not None:
-                try:
-                    real_user = current_user._get_current_object()
-                except RuntimeError:
-                    current_app.logger.exception("Unable to collect real user. Most likely due to unbound session.")
-                    return response
+            if self._producer is None:
+                return response
+
+            try:
+                real_user = current_user._get_current_object()
+                event = {
+                    "user_id": real_user.get_id(),
+                    "client_id": (
+                        current_token.client_id
+                        if current_token and hasattr(current_token, "client")
+                        else ""
+                    ),
+                    "endpoint": request.endpoint,
+                    "method": request.method,
+                    "timestamp": datetime.now().isoformat(),
+                    "status_code": response.status_code,
+                }
                 self._producer.send(
                     self.get_service_config("REQUEST_TOPIC"),
-                    {
-                        "user_id": real_user.get_id(),
-                        "client_id": (
-                            current_token.client_id
-                            if current_token and hasattr(current_token, "client")
-                            else ""
-                        ),
-                        "endpoint": request.endpoint,
-                        "method": request.method,
-                        "timestamp": datetime.now().isoformat(),
-                        "status_code": response.status_code,
-                    },
+                    event,
                 )
+            except Exception:
+                self._logger.warning("Kafka request telemetry dropped")
 
             return response
 
