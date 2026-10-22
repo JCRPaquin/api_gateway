@@ -230,3 +230,27 @@ must rotate deployed database and API credentials that may have appeared in
 historical startup, application, ingress, or CI logs. Restrict access to those
 logs and expire retained copies according to the incident-response and
 retention policies after rotation.
+### Redis serialization rollout and rollback
+
+Gateway-owned Redis data uses isolated namespaces. Storage data in DB 0 is written under
+`gateway:storage:v1:` and response cache data in DB 1 is written under
+`gateway:cache:v1:`. Values outside these namespaces, including values written by older
+pickle-based releases, are never deserialized or migrated.
+
+Use the following rollout order:
+
+1. Confirm that every configured resource-document endpoint is reachable; resource
+   documents and adaptive timing data are disposable and will be repopulated.
+2. Deploy the new release to every gateway instance, then drain and stop all old
+   instances.
+3. Remove old gateway storage keys from DB 0 using `SCAN` to identify the old key
+   pattern and `UNLINK` to delete keys. Delete by key name only; never `GET`, copy, or
+   otherwise read an old value. Do not flush DB 0 because Flask-Limiter shares it.
+4. After all old instances have drained, flush DB 1 only. DB 1 is dedicated to
+   disposable response-cache data.
+
+Never dual-read or deserialize legacy pickle values. A rollback to a pickle-reading
+release is prohibited unless both DB 0 gateway-owned storage keys and all of DB 1 have
+first been cleaned, and Redis has been isolated and authenticated. Prefer rolling
+forward with the new namespaces; a cold cache and reset adaptive timing state are the
+expected deployment impact.

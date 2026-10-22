@@ -15,7 +15,6 @@ from urllib.parse import urljoin
 import requests
 from authlib.integrations.flask_oauth2 import current_token, token_authenticated
 from authlib.integrations.sqla_oauth2 import create_bearer_token_validator
-from cachelib.serializers import RedisSerializer
 from flask import Flask, current_app, g, request
 from flask.wrappers import Response
 from flask_caching import Cache
@@ -36,6 +35,12 @@ from apigateway import extensions
 from apigateway.exceptions import NoClientError, NotFoundError, ValidationError
 from apigateway.logging_utils import exception_log_fields
 from apigateway.models import AnonymousUser, OAuth2Client, OAuth2Token, Role, User
+from apigateway.redis_serialization import (
+    RedisJsonCodec,
+    RedisSerializationError,
+    dumps_storage_value,
+    loads_storage_value,
+)
 from apigateway.utils import GatewayResourceProtector, ProxyView
 
 
@@ -915,6 +920,8 @@ class StorageService(GatewayService):
     It supports both Redis storage and fallbacks to memory storage in case Redis is down.
     """
 
+    KEY_PREFIX = "gateway:storage:v1:"
+
     def __init__(self, name: str = "STORAGE_SERVICE"):
         super().__init__(name)
         self._fallback_storage: dict = {}
@@ -923,21 +930,22 @@ class StorageService(GatewayService):
         super().init_app(app)
         self._redis_service = redis_service
         self._redis_down = False
-        self._serializer = RedisSerializer()
+        self._serializer = RedisJsonCodec()
+        self._key_prefix = self.get_service_config("KEY_PREFIX", self.KEY_PREFIX)
 
-    def _serialize(self, value: any) -> str | bytes:
-        """Serializes the given value.
+    def _storage_key(self, key: str) -> str:
+        return self._key_prefix + key
 
-        Args:
-            value (any): The value to serialize.
+    def _serialize(self, value: any) -> bytes:
+        """Serialize values without interfering with Redis numeric operations."""
+        return dumps_storage_value(self._serializer, value)
 
-        Returns:
-            str | bytes: The serialized value.
-        """
-        if isinstance(value, (int, float, str)):
-            return str(value)
-        else:
-            return self._serializer.dumps(value)
+    def _deserialize(self, key: str, value: bytes):
+        try:
+            return True, loads_storage_value(self._serializer, value)
+        except RedisSerializationError:
+            self._redis_service.delete(key)
+            return False, None
 
     def _transfer_to_redis(self):
         """
@@ -947,8 +955,6 @@ class StorageService(GatewayService):
         After the transfer is complete, the fallback storage is cleared.
         """
         for key, value in self._fallback_storage.items():
-            if isinstance(value, dict):
-                value = json.dumps(value)
             self._redis_service.set(key, self._serialize(value))
         self._fallback_storage.clear()
 
@@ -976,66 +982,82 @@ class StorageService(GatewayService):
 
     @handle_redis_exception
     def set(self, key: str, value: str, timeout: int = None) -> bool:
+        storage_key = self._storage_key(key)
         if not self._redis_down:
             value = self._serialize(value)
 
             if timeout is None:
-                return bool(self._redis_service.set(key, value))
+                return bool(self._redis_service.set(storage_key, value))
             else:
-                return bool(self._redis_service.setex(key, timeout, value))
+                return bool(self._redis_service.setex(storage_key, timeout, value))
         else:
-            self._fallback_storage[key] = value
+            self._fallback_storage[storage_key] = value
             return True
 
     @handle_redis_exception
     def get(self, key: str) -> str:
+        storage_key = self._storage_key(key)
         if not self._redis_down:
-            value = self._redis_service.get(key)
-
-            if value is not None:
-                value = self._serializer.loads(value)
-
+            value = self._redis_service.get(storage_key)
+            if value is None:
+                return None
+            _, value = self._deserialize(storage_key, value)
             return value
         else:
-            return self._fallback_storage.get(key)
+            return self._fallback_storage.get(storage_key)
 
     @handle_redis_exception
     def delete(self, key: str) -> bool:
+        storage_key = self._storage_key(key)
         if not self._redis_down:
-            return bool(self._redis_service.delete(key))
+            return bool(self._redis_service.delete(storage_key))
         else:
-            return bool(self._fallback_storage.pop(key, None))
+            return bool(self._fallback_storage.pop(storage_key, None))
 
     @handle_redis_exception
     def incr(self, key: str) -> int:
+        storage_key = self._storage_key(key)
         if not self._redis_down:
-            return self._redis_service.incr(key)
+            return self._redis_service.incr(storage_key)
         else:
-            self._fallback_storage[key] = self._fallback_storage.get(key, 0) + 1
-            return self._fallback_storage[key]
+            self._fallback_storage[storage_key] = (
+                self._fallback_storage.get(storage_key, 0) + 1
+            )
+            return self._fallback_storage[storage_key]
 
     @handle_redis_exception
     def incrby(self, key: str, increment: int) -> int:
+        storage_key = self._storage_key(key)
         if not self._redis_down:
-            return self._redis_service.incrby(key, increment)
+            return self._redis_service.incrby(storage_key, increment)
         else:
-            self._fallback_storage[key] = self._fallback_storage.get(key, 0) + increment
-            return self._fallback_storage[key]
+            self._fallback_storage[storage_key] = (
+                self._fallback_storage.get(storage_key, 0) + increment
+            )
+            return self._fallback_storage[storage_key]
 
     @handle_redis_exception
     def incrbyfloat(self, key: str, increment: float) -> float:
+        storage_key = self._storage_key(key)
         if not self._redis_down:
-            return self._redis_service.incrbyfloat(key, increment)
+            return self._redis_service.incrbyfloat(storage_key, increment)
         else:
-            self._fallback_storage[key] = self._fallback_storage.get(key, 0.0) + increment
-            return self._fallback_storage[key]
+            self._fallback_storage[storage_key] = (
+                self._fallback_storage.get(storage_key, 0.0) + increment
+            )
+            return self._fallback_storage[storage_key]
 
     @handle_redis_exception
     def has(self, key: str) -> bool:
+        storage_key = self._storage_key(key)
         if not self._redis_down:
-            return bool(self._redis_service.exists(key))
+            value = self._redis_service.get(storage_key)
+            if value is None:
+                return False
+            valid, _ = self._deserialize(storage_key, value)
+            return valid
         else:
-            return key in self._fallback_storage
+            return storage_key in self._fallback_storage
 
 
 class CacheService(GatewayService, Cache):
@@ -1049,9 +1071,18 @@ class CacheService(GatewayService, Cache):
         GatewayService.init_app(self, app)
 
         app.config.setdefault("CACHE_REDIS_URL", self.get_service_config("REDIS_URI"))
-        app.config.setdefault("CACHE_TYPE", self.get_service_config("CACHE_TYPE", "RedisCache"))
+        app.config.setdefault(
+            "CACHE_KEY_PREFIX", self.get_service_config("KEY_PREFIX", "gateway:cache:v1:")
+        )
+        app.config.setdefault(
+            "CACHE_TYPE",
+            self.get_service_config(
+                "CACHE_TYPE", "apigateway.redis_serialization.SafeRedisCache"
+            ),
+        )
 
         Cache.init_app(self, app)
+        app.extensions["cache"][self].serializer = RedisJsonCodec()
 
     def clear_cache(self, request_path: str, parameters: dict) -> bool:
         """Clears the cache for the specified request path and parameters.

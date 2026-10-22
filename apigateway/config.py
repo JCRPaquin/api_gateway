@@ -149,9 +149,13 @@ LIMITER_SERVICE_GROUPS = {
 # Redis service
 REDIS_SERVICE_URL = "redis://redis:6379/0"
 
+# Storage service
+STORAGE_SERVICE_KEY_PREFIX = "gateway:storage:v1:"
+
 
 # Cache service
-CACHE_SERVICE_CACHE_TYPE = "RedisCache"
+CACHE_SERVICE_CACHE_TYPE = "apigateway.redis_serialization.SafeRedisCache"
+CACHE_SERVICE_KEY_PREFIX = "gateway:cache:v1:"
 CACHE_SERVICE_REDIS_URI = (
     # NOTE: Do not use the same redis DB as other services
     "redis://redis:6379/1"
