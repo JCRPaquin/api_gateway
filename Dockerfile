@@ -31,7 +31,7 @@ COPY apigateway ./apigateway
 COPY migrations ./migrations
 COPY scripts ./scripts
 
-RUN install -d --owner=10001 --group=10001 --mode=0755 /app/apigateway/logs
+RUN install -d --owner=10001 --group=10001 --mode=0755 /app/logs
 
 USER 10001:10001
 

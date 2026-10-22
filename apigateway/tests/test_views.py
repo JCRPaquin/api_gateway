@@ -464,7 +464,7 @@ class TestChangeEmailView:
         old_email = authenticated_user.email
         with app.test_request_context(
             json={"password": "Valid_password1", "email": "new_email@gmail.com"},
-            headers={"Host":"https://scixplorer.org"}
+            headers={"Host": "scixplorer.org"},
         ):
             login_user(authenticated_user)
             _, status_code = change_email_view.post()

@@ -21,17 +21,95 @@ The PostgreSQL driver is declared once as the Python 3.12-compatible `psycopg2-b
 
 Setuptools 80.9.0 is a runtime-only compatibility dependency because the legacy Flask-Security-Too 5.3.3/passlib stack imports `pkg_resources`. It is not a build backend: gateway builds remain isolated to the exact Flit backend declared under `[build-system]`.
 
-`adsmutils` v2 is sourced from the upstream ADS repository through the commit-addressed archive `https://github.com/adsabs/ADSMicroserviceUtils/archive/8b20e6ea2cbea75bc3ccfa952bd9b5360bd82075.tar.gz`, the reviewed Python 3.12 source identity. `uv.lock` records and verifies the archive artifact hash, so synchronization does not require Git. The application factory preserves file, environment, and explicit configuration precedence while preventing adsmutils from creating a second Flask-SQLAlchemy extension. Reviewers must verify any proposed commit and archive-hash change against upstream history; a branch or tag archive is not an acceptable replacement.
+`adsmutils` v2 is sourced from the upstream ADS repository through the commit-addressed archive `https://github.com/adsabs/ADSMicroserviceUtils/archive/8b20e6ea2cbea75bc3ccfa952bd9b5360bd82075.tar.gz`, the reviewed Python 3.12 source identity. `uv.lock` records and verifies the archive artifact hash, so synchronization does not require Git. The application factory prevents adsmutils from creating a second Flask-SQLAlchemy extension or reprocessing environment values through its legacy loader. Reviewers must verify any proposed commit and archive-hash change against upstream history; a branch or tag archive is not an acceptable replacement.
+
+## Configuration
+
+The application validates configuration before telemetry, extensions, or routes are initialized. A startup error lists invalid configuration key names in deterministic order; it never includes configured secret values. The same startup contract applies to the WSGI entry point, CLI, Alembic environment, migration helpers, and administrative scripts.
+
+`apigateway/config.py` is the sole source of gateway defaults and environment parsing; explicit application-factory arguments take final precedence. The legacy `local_config.py` loading path is intentionally unsupported. Environment values are parsed without logging their names or values, so secrets are not exposed and comma-separated host and origin lists retain their configured types.
+
+### Required secrets
+
+The following settings have no tracked or runtime fallback:
+
+- `SECRET_KEY`
+- `SECURITY_SERVICE_SECRET_KEY`
+- `SECURITY_SERVICE_VERIFY_PASSWORD_SALT`
+- `SECURITY_SERVICE_VERIFY_EMAIL_SALT`
+- `GOOGLE_RECAPTCHA_PRIVATE_KEY`
+
+Each setting accepts either its direct environment variable or the corresponding `_FILE` variable (for example, `SECRET_KEY_FILE`), never both. Secret files are read with a 16 KiB limit. Exactly one terminal LF or CRLF written by secret-mount tooling is removed; all other bytes and whitespace are significant. Files must be readable when the process starts.
+
+The Flask key, serializer key, password-token salt, and email-token salt must each contain at least 32 decoded bytes. Known placeholders are rejected, and the serializer key and two purpose salts must all be distinct. The reCAPTCHA secret must be nonempty and cannot be a placeholder.
+
+`SECRET_KEY_ENCODING` is mandatory in meaning and defaults to the explicit `utf-8` mode:
+
+- `utf-8`: `SECRET_KEY` must be text and its UTF-8 bytes are used;
+- `hex`: `SECRET_KEY` must be valid hexadecimal text and its decoded bytes are used;
+- `raw`: the value must already be bytes, normally supplied through `SECRET_KEY_FILE`.
+
+There is no automatic hexadecimal detection. Deployments migrating a hexadecimal key must set `SECRET_KEY_ENCODING=hex` explicitly.
+
+Generate independent random values for every signing setting. If any old public/default value was effective, rotate both Flask and SecurityService keys and both salts, invalidate all browser sessions, and purge or invalidate pending verification, email-change, and password-reset state. Rotation intentionally invalidates existing signed links and sessions.
+
+### Hosts, browser policy, and TLS
+
+`TRUSTED_HOSTS` is a comma-separated list of exact request authorities, with an explicit port where one is expected. Wildcards, suffix matching, URLs, userinfo, paths, malformed authorities, and unlisted hosts are rejected before route handlers execute.
+
+`SITE_HOST_MAPPING` is a JSON object whose keys exactly match `TRUSTED_HOSTS` and whose values are `ADS` or `SCIX`, for example:
+
+```text
+TRUSTED_HOSTS=gateway.example.org,scix-gateway.example.org
+SITE_HOST_MAPPING={"gateway.example.org":"ADS","scix-gateway.example.org":"SCIX"}
+```
+
+This mapping is the only source of ADS/SciX request-site selection. A hostname containing `scixplorer`, or ending in `shadow`, receives no special behavior.
+
+`CORS_DOMAINS` is a comma-separated, nonempty list of exact HTTPS origins. HTTP origins, paths, credentials, query strings, and fragments are rejected. Credentialed CORS is enabled only for this list.
+
+The secure defaults are:
+
+```text
+SESSION_COOKIE_SECURE=true
+SESSION_COOKIE_HTTPONLY=true
+SESSION_COOKIE_SAMESITE=Lax
+HTTPS_ENFORCEMENT=true
+TRUSTED_PROXY_HOPS=0
+```
+
+`SameSite=None` is accepted only with `SESSION_COOKIE_SECURE=true`. Talisman explicitly enforces HTTPS and HSTS. Direct production HTTP is not supported.
+
+`HTTPS_ENFORCEMENT=false` is an explicit deployment option only when a TLS edge guarantees HTTPS to clients and the application listener is unreachable directly. It is never a public-HTTP mode. Tests may use it only through the factory escape described below.
+
+When TLS terminates at a trusted reverse proxy, set `TRUSTED_PROXY_HOPS` to the exact number of trusted proxy hops. Only `X-Forwarded-Proto` is consumed; unrelated forwarded host, address, port, and prefix fields are not trusted. The edge must overwrite that header and the backend listener must not be publicly reachable. Leave `TRUSTED_PROXY_HOPS=0` when the application receives TLS directly.
+
+### Test-only contract
+
+Network bypasses are unavailable through normal runtime configuration. Tests that need them must call:
+
+```python
+create_app(
+    TESTING=True,
+    RECAPTCHA_TEST_BYPASS=True,
+    MAIL_TEST_BYPASS=True,
+    HTTPS_ENFORCEMENT=False,
+    # Strong, distinct signing values and exact host/CORS settings are still required.
+    allow_insecure_test_config=True,
+)
+```
+
+`TESTING=True` alone never bypasses reCAPTCHA, mail, HTTPS, secret, host, or CORS validation. The factory-only argument is rejected without `TESTING=True`. Production code must configure a real reCAPTCHA secret.
 
 ## Running the application
 
-For a local container environment:
+Configure all required secrets, hosts, CORS origins, CAPTCHA, and transport settings before starting a local container environment:
 
 ```bash
 docker compose up
 ```
 
-The API is exposed at `http://localhost:5000`. The gateway container runs Gunicorn as numeric non-root user 10001 with root-owned application files, a read-only root filesystem, and no writable source bind mount. Compose provides a UID-compatible tmpfs only for `/app/apigateway/logs`, where adsmutils writes runtime logs. Database migrations run before Gunicorn starts.
+The API is exposed at `http://localhost:5000`. The gateway container runs Gunicorn as numeric non-root user 10001 with root-owned application files, a read-only root filesystem, and no writable source bind mount. Compose provides a UID-compatible tmpfs only for `/app/logs`, where adsmutils writes runtime logs. Database migrations run before Gunicorn starts.
 
 For local execution without Docker:
 
@@ -42,6 +120,8 @@ uv run --frozen gunicorn --bind=127.0.0.1:8181 wsgi:application
 ```
 
 `wsgi.py` exposes the production application object without enabling the Werkzeug reloader or debugger. Gunicorn 26.2.0 is the reviewed Python 3.12-compatible production server.
+
+Choose Gunicorn worker and thread counts for the deployment's CPU and memory limits. Put the listener behind the configured TLS edge (or bind it directly with a TLS-capable server); the gateway must not be exposed as a public plaintext listener.
 
 ## Tests and CI
 
@@ -87,7 +167,7 @@ The package's exported `blocklist` is the upstream policy source. `apigateway/di
 
 ## Database versioning
 
-Database versioning is managed using Alembic:
+Database versioning is managed using Alembic and uses the same fail-closed application configuration as the WSGI process. Configure all required secrets, hosts, CORS origins, CAPTCHA, and transport settings before invoking it:
 
 ```bash
 alembic upgrade <revision>

@@ -1,15 +1,17 @@
 from pathlib import Path
 
-from adsmutils import ADSFlask, load_config
+from adsmutils import ADSFlask
 from authlib.integrations.flask_oauth2 import current_token
 from authlib.integrations.sqla_oauth2 import (
     create_query_client_func,
     create_save_token_func,
 )
-from flask import Flask, abort, jsonify, request, session, current_app
+from flask import Flask, abort, current_app, jsonify, request, session
 from flask_restful import Api
 from marshmallow import ValidationError as MarshmallowValidationError
+from werkzeug.middleware.proxy_fix import ProxyFix
 
+from apigateway import config as gateway_config
 from apigateway import exceptions, extensions, views
 from apigateway.models import OAuth2Client, OAuth2Token, User
 
@@ -66,8 +68,30 @@ def register_extensions(app: Flask):
     extensions.cache_service.init_app(app)
     extensions.kakfa_producer_service.init_app(app)
     extensions.storage_service.init_app(app, extensions.redis_service)
-    extensions.talisman.init_app(app, force_https=False)
+    extensions.talisman.init_app(
+        app,
+        force_https=app.config["HTTPS_ENFORCEMENT"],
+        session_cookie_secure=app.config["SESSION_COOKIE_SECURE"],
+        session_cookie_http_only=app.config["SESSION_COOKIE_HTTPONLY"],
+        strict_transport_security=True,
+    )
     extensions.csrf.init_app(app)
+
+
+def register_authority_guard(app: Flask):
+    """Reject malformed or untrusted request authorities before route handlers."""
+
+    @app.before_request
+    def require_trusted_authority():
+        host_headers = request.headers.getlist("Host")
+        if len(host_headers) != 1:
+            abort(400)
+        try:
+            authority = gateway_config.canonical_authority(host_headers[0])
+        except ValueError:
+            abort(400)
+        if authority not in app.config["TRUSTED_HOSTS"]:
+            abort(400)
 
 
 def register_hooks(app: Flask):
@@ -139,6 +163,10 @@ def register_error_handlers(app: Flask):
     @app.errorhandler(exceptions.NoClientError)
     def no_client_error(e):
         return jsonify({"message": e.value}), 500
+
+    @app.errorhandler(400)
+    def on_400(e):
+        return jsonify({"message": "Bad request"}), 400
 
     @app.errorhandler(401)
     def on_401(e):
@@ -219,17 +247,17 @@ def register_views(flask_api: Api):
     flask_api.add_resource(views.Resources, "/resources")
 
 
-def create_app(**config):
-    """Create application and initialize dependencies.
+def create_app(*, allow_insecure_test_config=False, **local_config):
+    """Create the application and initialize its dependencies.
 
-    Returns:
-        ADSFlask: Application object
+    ``allow_insecure_test_config`` is a factory-only escape for explicit
+    network-facing test bypasses. It is accepted only together with
+    ``TESTING=True`` and cannot be supplied through application configuration.
     """
-    effective_config = load_config(
-        proj_home=str(_PROJECT_ROOT),
-        app_name=_APP_NAME,
-    )
-    effective_config.update(config)
+    effective_config = {
+        key: value for key, value in vars(gateway_config).items() if key.isupper()
+    }
+    effective_config.update(local_config)
     database_uri = effective_config.get("SQLALCHEMY_DATABASE_URI")
 
     # ADSFlask v2 creates its own Flask-SQLAlchemy extension whenever a
@@ -238,25 +266,27 @@ def create_app(**config):
     adsmutils_config = dict(effective_config)
     adsmutils_config["SQLALCHEMY_DATABASE_URI"] = None
 
+    # ADSFlask v2 always invokes its legacy config loader. The repository root
+    # intentionally has no config.py, so pointing it there prevents a second
+    # environment pass from retyping values or logging secrets. The complete
+    # application configuration is supplied explicitly below.
     app = ADSFlask(
         _APP_NAME,
         static_folder=None,
         template_folder="templates",
-        proj_home=str(_PROJECT_ROOT),
+        proj_home=str(_PROJECT_ROOT.parent),
         local_config=adsmutils_config,
     )
     app.config["SQLALCHEMY_DATABASE_URI"] = database_uri
 
-    # old baggage... Consul used to store keys in hexadecimal form
-    # so the production/staging databases both convert that into raw bytes
-    # but those raw bytes were non-ascii chars (unsafe to pass through
-    # env vars). So we must continue converting hex ...
-    if app.config.get("SECRET_KEY", None):
-        try:
-            app.config["SECRET_KEY"] = bytes.fromhex(app.config["SECRET_KEY"])
-            app.logger.warning("Converted SECRET_KEY from hex format into bytes")
-        except ValueError:
-            app.logger.warning("Most likely the SECRET_KEY is not in hex format")
+    gateway_config.validate_runtime_config(
+        app.config,
+        allow_insecure_test_config=allow_insecure_test_config,
+    )
+    trusted_proxy_hops = app.config["TRUSTED_PROXY_HOPS"]
+    if trusted_proxy_hops:
+        app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=trusted_proxy_hops)
+    register_authority_guard(app)
 
     # Service name is required for most backends,
     # and although it's not necessary for console export,

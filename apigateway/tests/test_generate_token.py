@@ -17,7 +17,7 @@ def test_get_token_existing_user_existing_client(mock_add_arguments, app, mock_r
             MagicMock(filter_by=MagicMock(return_value=MagicMock(all=MagicMock(return_value=[mock_simple_token])))),
         ]
         
-        result = get_token()
+        result = get_token(app)
 
         assert result['access_token'] == "access_token"
         assert result['refresh_token'] == "refresh_token"
@@ -29,7 +29,7 @@ def test_get_token_no_result_found_exit(mock_add_arguments, app):
         mock_query.return_value.filter_by.return_value.one.side_effect = NoResultFound
         
         with pytest.raises(SystemExit) as error:
-            get_token()
+            get_token(app)
         
         assert "User with email test@gmail.com not found, and --create-user was not specified. Exiting." in str(error.value)
     
@@ -43,7 +43,7 @@ def test_get_token_no_result_found_create_new_user(mock_add_arguments, app, mock
 
         mock_query.return_value.filter_by.return_value.all.return_value = [mock_simple_token]
         
-        get_token()
+        get_token(app)
 
         # Check if a new user was created
         mock_add.assert_called()
@@ -54,7 +54,7 @@ def test_get_token_multiple_users_raises_error(mock_add_arguments, app):
         mock_query.return_value.filter_by.return_value.one.side_effect = MultipleResultsFound
 
         with pytest.raises(DatabaseIntegrityError):
-            get_token()
+            get_token(app)
 
 def test_get_token_multiple_clients_raises_error(mock_add_arguments, app, mock_regular_user):
     with patch("apigateway.extensions.db.session.query") as mock_query:
@@ -67,7 +67,7 @@ def test_get_token_multiple_clients_raises_error(mock_add_arguments, app, mock_r
         ]
         
         with pytest.raises(DatabaseIntegrityError) as error:
-            get_token()
+            get_token(app)
 
         assert ('Multiple oauthclients found for that user and name.' in str(error.value))
 
@@ -85,7 +85,7 @@ def test_create_client_and_metadata(mock_add_arguments, app, mock_regular_user, 
             MagicMock(filter_by=MagicMock(return_value=MagicMock(all=MagicMock(return_value=[mock_simple_token])))),
         ]
         
-        get_token()
+        get_token(app)
 
         # Get the created client from the mock
         created_client = mock_add.call_args[0][0]
@@ -117,7 +117,7 @@ def test_get_token_no_tokens_found(mock_add_arguments, app, mock_regular_user, m
             MagicMock(filter_by=MagicMock(return_value=MagicMock(all=MagicMock(return_value=[mock_simple_token])))),
         ]
 
-        get_token()
+        get_token(app)
 
         created_token = mock_add.call_args[0][0]
         

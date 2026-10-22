@@ -11,7 +11,7 @@ services:
     read_only: true
     tmpfs:
       - /tmp
-      - /app/apigateway/logs:uid=10001,gid=10001,mode=0755
+      - /app/logs:uid=10001,gid=10001,mode=0755
     ports:
       - "5000:8181"
     depends_on:

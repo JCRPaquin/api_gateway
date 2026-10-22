@@ -26,8 +26,11 @@ from apigateway.models import (
     User,
 )
 from apigateway.utils import (
+    generate_complete_blocklist,
     get_json_body,
+    get_request_site_settings,
     make_json_diff,
+    normalize_email_domain,
     require_non_anonymous_bootstrap_user,
     send_account_registration_attempt_email,
     send_email,
@@ -35,8 +38,6 @@ from apigateway.utils import (
     send_password_reset_email,
     send_welcome_email,
     verify_recaptcha,
-    generate_complete_blocklist,
-    normalize_email_domain,
 )
 
 
@@ -410,14 +411,8 @@ class ChangeEmailView(Resource):
         return session.query(User).filter_by(email=email).first() is not None
 
     def _send_verification_email(self, token, new_email: str):
-        if "scixplorer" in request.headers.get("Host", ""):
-            ui_env = "SciX"
-            ui_url = current_app.config.get("SCIX_HOST_DOMAIN", "dev.scixplorer.org")
-            verification_url = f"{current_app.config['SCIX_VERIFY_URL']}/change-email/{token}"
-        else:
-            ui_env = "ADS"
-            ui_url = current_app.config.get("ADS_HOST_DOMAIN", "dev.adsabs.harvard.edu")
-            verification_url = f"{current_app.config['VERIFY_URL']}/change-email/{token}"            
+        ui_env, ui_url, verify_url = get_request_site_settings()
+        verification_url = f"{verify_url}/change-email/{token}"
 
 
         send_email(
@@ -430,12 +425,7 @@ class ChangeEmailView(Resource):
         )
 
     def _send_notify_email_change(self):
-        if "scixplorer" in request.headers.get("Host", ""):
-            ui_env = "SciX"
-            ui_url = current_app.config.get("SCIX_HOST_DOMAIN", "dev.scixplorer.org")
-        else:
-            ui_env = "ADS"
-            ui_url = current_app.config.get("ADS_HOST_DOMAIN", "dev.adsabs.harvard.edu")
+        ui_env, ui_url, _ = get_request_site_settings()
         send_email(
             current_app.config["MAIL_DEFAULT_SENDER"],
             current_user.email,

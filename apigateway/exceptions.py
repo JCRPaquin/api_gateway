@@ -1,6 +1,16 @@
 from werkzeug.exceptions import HTTPException
 
 
+class ConfigurationError(RuntimeError):
+    """Raised when application startup configuration is unsafe or incomplete."""
+
+    def __init__(self, invalid_keys):
+        self.invalid_keys = tuple(sorted(set(invalid_keys)))
+        super().__init__(
+            "Invalid application configuration: {}".format(", ".join(self.invalid_keys))
+        )
+
+
 class ValidationError(Exception):
     """
     Exception raised when some user data are invalid

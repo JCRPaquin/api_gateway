@@ -78,12 +78,12 @@ def add_arguments(parser):
     )
 
 
-def get_token():
+def get_token(app=None):
   
     parser = argparse.ArgumentParser()
     add_arguments(parser)
     args = parser.parse_args()
-    app = create_app() 
+    app = app or create_app()
 
     with app.app_context() as context:
         

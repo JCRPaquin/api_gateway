@@ -5,10 +5,11 @@ from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
 
 from apigateway.app import create_app
 
-app = create_app()
-FlaskInstrumentor.instrument_app(app)
+_gateway = create_app()
+FlaskInstrumentor.instrument_app(_gateway)
 
-with app.app_context():
-    SQLAlchemyInstrumentor().instrument(engine=app.db.engine)
+with _gateway.app_context():
+    SQLAlchemyInstrumentor().instrument(engine=_gateway.db.engine)
 
-application = DispatcherMiddleware(Response("Not Found", status=404), {"/v1": app})
+application = DispatcherMiddleware(Response("Not Found", status=404), {"/v1": _gateway})
+del _gateway
