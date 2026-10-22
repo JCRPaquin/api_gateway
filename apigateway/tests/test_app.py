@@ -26,6 +26,10 @@ def test_environment_boot_config_is_typed_without_logging_secrets():
             "subprocess-email-salt-32-bytes-minimum"
         ),
         "GOOGLE_RECAPTCHA_PRIVATE_KEY": "subprocess-real-recaptcha-key",
+        "DATABASE_USER": "gateway_subprocess_user",
+        "DATABASE_PASSWORD": "database-subprocess-password-32-bytes",
+        "REDIS_USER": "gateway_subprocess_redis",
+        "REDIS_PASSWORD": "redis-subprocess-password-32-bytes",
     }
     environment = os.environ.copy()
     for key in (
@@ -34,6 +38,10 @@ def test_environment_boot_config_is_typed_without_logging_secrets():
         "SECURITY_SERVICE_VERIFY_PASSWORD_SALT_FILE",
         "SECURITY_SERVICE_VERIFY_EMAIL_SALT_FILE",
         "GOOGLE_RECAPTCHA_PRIVATE_KEY_FILE",
+        "DATABASE_USER_FILE",
+        "DATABASE_PASSWORD_FILE",
+        "REDIS_USER_FILE",
+        "REDIS_PASSWORD_FILE",
     ):
         environment.pop(key, None)
     environment.update(
@@ -57,7 +65,6 @@ def test_environment_boot_config_is_typed_without_logging_secrets():
         from apigateway.app import create_app
 
         app = create_app(
-            SQLALCHEMY_DATABASE_URI="sqlite:///:memory:",
             ENABLE_OTEL=False,
             PROXY_SERVICE_WEBSERVICES={},
         )

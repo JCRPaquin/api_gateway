@@ -12,6 +12,9 @@ def app(request):
     app = create_app(
         **{
             "SQLALCHEMY_DATABASE_URI": "sqlite:///:memory:",
+            "REDIS_SERVICE_URL": "redis://localhost:6379/0",
+            "LIMITER_SERVICE_STORAGE_URI": "redis://localhost:6379/0",
+            "CACHE_SERVICE_REDIS_URI": "redis://localhost:6379/1",
             "SQLALCHEMY_ECHO": False,
             "TESTING": True,
             "DEBUG": False,

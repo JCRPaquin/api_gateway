@@ -5,8 +5,8 @@ from logging.config import fileConfig
 from alembic import context
 from sqlalchemy import engine_from_config, pool
 
+from apigateway.config import load_migration_database_url
 from apigateway.models import base_model
-from apigateway.migration_utils import get_app_config
 
 project_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(project_dir)
@@ -66,7 +66,7 @@ def run_migrations_online() -> None:
     """
     cfg = config.get_section(config.config_ini_section)
     if "use_flask_db_url" in cfg and cfg["use_flask_db_url"] == "true":
-        cfg["sqlalchemy.url"] = get_app_config("SQLALCHEMY_DATABASE_URI")
+        cfg["sqlalchemy.url"] = load_migration_database_url()
 
     engine = engine_from_config(cfg, prefix="sqlalchemy.", poolclass=pool.NullPool)
 

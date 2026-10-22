@@ -53,6 +53,14 @@ There is no automatic hexadecimal detection. Deployments migrating a hexadecimal
 
 Generate independent random values for every signing setting. If any old public/default value was effective, rotate both Flask and SecurityService keys and both salts, invalidate all browser sessions, and purge or invalidate pending verification, email-change, and password-reset state. Rotation intentionally invalidates existing signed links and sessions.
 
+### State-service credentials
+
+Production database configuration is structured: `DATABASE_HOST`, `DATABASE_PORT`, `DATABASE_NAME`, `DATABASE_USER` or `DATABASE_USER_FILE`, and `DATABASE_PASSWORD` or `DATABASE_PASSWORD_FILE`. Redis likewise uses `REDIS_HOST`, `REDIS_PORT`, `REDIS_USER` or `REDIS_USER_FILE`, and `REDIS_PASSWORD` or `REDIS_PASSWORD_FILE`. User and password values have no fallback, direct and file forms are mutually exclusive, and missing, short, or known placeholder passwords stop startup. Preassembled `SQLALCHEMY_DATABASE_URI`, `REDIS_SERVICE_URL`, `LIMITER_SERVICE_STORAGE_URI`, and `CACHE_SERVICE_REDIS_URI` values are rejected outside the explicit test-only factory escape.
+
+The application builds percent-safe URLs with SQLAlchemy's URL API. Storage and the limiter share authenticated Redis database 0; cache data uses authenticated database 1. In the shipped Compose deployment, only `_FILE` forms are used and every credential comes from an external secret mount.
+State-service hosts must be canonical lowercase DNS names, canonical IPv4 literals, or canonical compressed IPv6 literals enclosed in brackets. Userinfo, authority delimiters, paths, queries, fragments, percent encoding, IPv6 zone identifiers, noncanonical addresses, and malformed brackets fail startup.
+
+
 ### Hosts, browser policy, and TLS
 
 `TRUSTED_HOSTS` is a comma-separated list of exact request authorities, with an explicit port where one is expected. Wildcards, suffix matching, URLs, userinfo, paths, malformed authorities, and unlisted hosts are rejected before route handlers execute.
@@ -109,9 +117,93 @@ Configure all required secrets, hosts, CORS origins, CAPTCHA, and transport sett
 docker compose up
 ```
 
-The API is exposed at `http://localhost:5000`. The gateway container runs Gunicorn as numeric non-root user 10001 with root-owned application files, a read-only root filesystem, and no writable source bind mount. Compose provides a UID-compatible tmpfs only for `/app/logs`, where adsmutils writes runtime logs. Database migrations run before Gunicorn starts.
+Choose worker and thread counts for the deployment's CPU and memory limits. Put the listener behind a configured TLS edge. `wsgi.py` cannot launch Werkzeug's development server or reloader.
 
-For local execution without Docker:
+### Compose deployment prerequisites
+This topology is stacked on three security changes which **must land before it is deployed**:
+
+1. `security/01-safe-observability`, which removes the complete database URI from Alembic output. Assume any database password used by an older migration was logged; rotate it and review or purge retained logs before starting this stack.
+2. `security/redis-json-codec`, which removes executable Redis deserialization and cuts storage and cache over to versioned namespaces. Follow that change's namespace cleanup procedure; never make an old pickle-reading release share Redis with this deployment.
+3. `security/ops-migration-integrity`, which removes the historical `create_app()` call from revision `26889be04d70`. A fresh-volume migration cannot remain database-only until that revision is configuration-independent.
+
+The Compose file deliberately has no local secret files or secret-valued environment variables. Its secrets are all declared `external: true`; the deployment platform must provision them before `docker compose up`:
+
+| External secret | Contents |
+| --- | --- |
+| `postgres_bootstrap_user` | PostgreSQL initialization/cutover administrator; mounted only by `db` |
+| `postgres_bootstrap_password` | Bootstrap administrator password |
+| `postgres_owner_user` | Dedicated database owner/migration role name |
+| `postgres_owner_password` | Owner/migration password |
+| `postgres_runtime_user` | Distinct non-owner web role name |
+| `postgres_runtime_password` | Runtime role password |
+| `redis_username` | Named Redis ACL user |
+| `redis_password` | Redis ACL password |
+| `gateway_flask_key` | Flask signing key |
+| `gateway_security_key` | Serializer signing key |
+| `gateway_password_salt` | Password-token purpose salt |
+| `gateway_email_salt` | Email-token purpose salt |
+| `gateway_recaptcha_key` | Production reCAPTCHA secret |
+| `gateway_tls_certificate` | CA-issued full certificate chain in PEM form |
+| `gateway_tls_private_key` | Matching TLS private key in PEM form |
+
+Generate every password, key, and salt independently in a protected operator environment. Database/Redis role names and their passwords must contain only letters, digits, underscores, and hyphens; passwords should be at least 32 random characters. Hexadecimal output from `openssl rand -hex 32` meets that contract. Pipe generated values directly into the platform secret manager, for example `openssl rand -hex 32 | docker secret create <name> -` on a platform that supplies Docker external secrets. Do not write values under the checkout, put them in `.env`, pass them in a Compose command, or paste them into shell history. Obtain the reCAPTCHA secret and TLS materials from their respective providers; the repository intentionally contains no development certificate or fallback secret.
+
+The nonsecret request policy remains deployment-specific and is required when rendering Compose:
+
+```bash
+export TRUSTED_HOSTS=gateway.example.org
+export SITE_HOST_MAPPING='{"gateway.example.org":"ADS"}'
+export CORS_DOMAINS=https://ui.example.org
+```
+
+The TLS edge is the only service with a host publication (`443`). It overwrites `X-Forwarded-Proto`, while the gateway has no host port and trusts exactly that one proxy hop. PostgreSQL and Redis are attached only to the `internal: true` backend network and have no host ports. Do not add host publications for troubleshooting; use an authenticated, audited administrative container on the backend network.
+
+### First database volume and startup
+
+For a new, empty `./data/db` directory, the PostgreSQL image creates a bootstrap administrator from its external secrets and runs `deployment/init-runtime-role.sh`. The script creates distinct owner/migration and runtime logins, transfers database and managed-schema ownership to the non-superuser migration owner, and normalizes both roles to `LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS`. It removes every membership edge to or from the bootstrap, owner, and runtime roles, including PostgreSQL 17 grants recorded under other grantors, and clears the owner/runtime global and per-database role settings. PostgreSQL 17 parameter `SET` and `ALTER SYSTEM` grants are reduced to an empty cluster-wide allowlist, including grants to `PUBLIC` or unrelated roles. Managed database, `public` schema, relation, column, routine, and type ACLs are rebuilt so only the owner and the runtime allowlist remain. The runtime receives database `CONNECT`, schema `USAGE`, table DML, sequence access, and matching owner default privileges; `PUBLIC` and unrelated roles receive none of those managed privileges. Owner and bootstrap default privileges also deny `PUBLIC` execution of future routines. The bootstrap credential is never mounted into the migration or gateway service.
+
+Start the stack only after all external secrets and the three nonsecret policy variables are available:
+
+```bash
+docker compose up -d
+docker compose ps
+```
+
+PostgreSQL and the authenticated Redis ACL must become healthy before the database-only migration service starts. Migration loads only the structured owner database settings; it does not create the Flask application, mount Redis/signing/CAPTCHA secrets, or depend on Redis. Connection failures use a fixed six-attempt capped exponential backoff and the one-shot service has a bounded `on-failure:3` restart. The long-lived gateway starts only after that service exits successfully. Its command executes Gunicorn directly and never invokes Alembic.
+
+### Existing-volume role cutover
+
+`POSTGRES_USER_FILE`, `POSTGRES_PASSWORD_FILE`, and `/docker-entrypoint-initdb.d` are used automatically only when PostgreSQL initializes an empty volume. Changing those secrets does not modify an existing role or grant on an existing `./data/db`.
+
+For retained data:
+
+1. Take and validate a database backup, stop the old web processes, and record the current administrative/database-owner identity through a trusted connection. Provision that identity as the bootstrap secret for the cutover; it is not an application or migration credential.
+2. Provision distinct owner/migration and runtime role secrets. Recreate the `db` container so it mounts the current external secrets, then run `docker compose exec db /docker-entrypoint-initdb.d/010-runtime-role.sh`.
+3. The script creates or corrects both non-superuser roles; removes memberships both to and from the bootstrap, owner, and runtime roles; resets every owner/runtime role setting, including database-specific settings; and removes all entries from the PostgreSQL 17 parameter-privilege allowlist. It rejects a runtime-owned extension so an administrator must transfer or drop that extension before rerunning, and accepts other installed extensions only when the configured bootstrap or migration role owns them. It then transfers all non-extension database and managed-`public` ownership to the migration owner, verifies every managed object has that owner, and verifies the runtime owns no database, schema, relation, routine, type, or extension anywhere in the connected database. Extension members remain under their trusted non-runtime bootstrap or migration extension owner. The script fails rather than modifying any direct runtime grant or default ACL outside `public`; inspect and remove such grants through the trusted administrator before rerunning.
+4. For the managed database and schema, the script first removes retained database, schema, relation, column, routine, type, and owner/bootstrap default ACLs from `PUBLIC`, runtime, and unrelated roles. This includes `PUBLIC` or direct execution grants on retained `SECURITY DEFINER` routines. It then reapplies only runtime `CONNECT`, `public` schema `USAGE`, managed table DML, managed sequence access, and matching owner defaults. Global owner/bootstrap defaults revoke `PUBLIC` execution on future routines. Run `docker compose run --rm migrate` and inspect its nonsecret completion status.
+5. Start the gateway only after migration succeeds. Disable login for any superseded legacy identity after verifying it owns no objects and no client uses it. Confirm that neither state service has a host publication.
+
+Never point the gateway at the owner secret as a temporary cutover shortcut. If the existing volume cannot meet the ownership checks, stop and repair ownership with the trusted administrator rather than broadening the runtime grants. Disposable development data may instead be stopped, backed up if needed, removed explicitly by the operator, and recreated as a first volume; deployment scripts never delete it.
+
+### Health, rotation, firewall, and rollback
+
+The Redis healthcheck first requires an unauthenticated `PING` to fail and then requires an authenticated `PONG` from the named ACL user. Its ACL can address only `gateway:storage:v1:*`, `gateway:cache:v1:*`, and `LIMITS:*`, and permits only the storage/cache/limiter commands documented by the `security/redis-json-codec` prerequisite. Administrative commands, flushes, monitor, persistence controls, client management, pub/sub, arbitrary `EVAL`, and script management other than required `SCRIPT LOAD` are unavailable. The PostgreSQL healthcheck gates migration on server readiness. After startup, verify the public status endpoint through the real certificate, for example `curl https://gateway.example.org/v1/accounts/status`, and confirm that `docker compose exec redis redis-cli ping` returns `NOAUTH`. Inspect database role attributes, both directions of role membership, `pg_db_role_setting`, `pg_parameter_acl`, extension ownership, all routine/type ownership, relation and column ACLs, routine ACLs, and default ACLs through a trusted administrative session. The parameter ACL must contain no `SET` or `ALTER SYSTEM` grant. The runtime role must not own objects, create schema objects, create databases or roles, own/manage/drop extensions, inherit or `SET ROLE` to another role, be reachable through another role's membership, execute managed routines, or retain privileges outside `public`; `PUBLIC` must not retain managed database/schema privileges or execute managed routines.
+
+Host and cloud firewalls should admit only TCP 443 from intended clients. Deny public and host-LAN access to 8181, 5432, and 6379 in addition to relying on the absence of Compose publications. Administrative access belongs on a restricted management path, not a temporary state-service port.
+
+Rotate one credential class at a time:
+
+- **Bootstrap database:** use this credential only through the isolated `db` initialization/cutover path. Update its external secret, recreate only `db`, run the cutover script through the local trusted connection, then remove any superseded administrator login after ownership verification. Neither migration nor gateway receives this secret.
+- **Runtime database:** quiesce gateway traffic, update the external runtime password, rerun the database initialization/grant script through the trusted local connection, recreate the gateway container, and verify DML plus denied DDL before resuming traffic.
+- **Owner database:** update the owner secret, run the initialization script through the bootstrap-only local connection to apply it, recreate the migration service, and verify an Alembic status command emits no URI. The gateway does not receive this secret.
+- **Redis:** stop gateway traffic, replace the external ACL password, recreate Redis and the gateway, and verify both the negative unauthenticated and positive authenticated health checks. Treat Redis data as disposable according to the JSON-codec namespace runbook.
+- **Signing, CAPTCHA, and TLS:** update the corresponding external secret and recreate only its consumers. Signing-key rotation invalidates the state described under Required secrets.
+
+For rollback, stop the gateway first, run any reviewed schema downgrade with the owner-only migration service, and then deploy the prior compatible application while retaining private networks and authentication. Do not roll back to in-process web migrations, a published plaintext gateway, an unauthenticated Redis instance, an owner-powered web process, or a release that reads legacy pickle data. If credentials may have reached earlier Alembic logs, rotate them again; reverting code cannot retract a disclosed value.
+
+## Development
+
+CPython 3.12 and uv 0.12.13 are required. For local execution without Docker, install the locked runtime environment and configure the required database settings before invoking Alembic or Gunicorn:
 
 ```bash
 uv sync --frozen
@@ -149,7 +241,7 @@ uv pip check --python .venv/bin/python
 
 Review the complete lock diff, all source URLs and artifact hashes, including the commit-addressed and hash-locked `adsmutils` archive, before committing a regenerated lock. Lock entries must never be handwritten or inferred.
 
-The Python 3.12.15 slim-bookworm, uv 0.12.13, PostgreSQL 17.10 bookworm, and Redis 8.2.9 bookworm multi-architecture image manifests were resolved and reviewed in this PR. Docker, Compose, and CI pin the applicable images by digest. Deployment owners must retain those platform manifests and generate an image SBOM for each release.
+The Python 3.12.15 slim-bookworm, uv 0.12.13, PostgreSQL 17.10 bookworm, Redis 8.2.9 bookworm, and Nginx 1.27 Alpine multi-architecture image manifests were resolved and reviewed in this PR. Docker, Compose, and CI pin the applicable images by digest. Deployment owners must retain those platform manifests and generate an image SBOM for each release.
 
 ## Reviewed dependency and email-domain policy updates
 
@@ -167,7 +259,7 @@ The package's exported `blocklist` is the upstream policy source. `apigateway/di
 
 ## Database versioning
 
-Database versioning is managed using Alembic and uses the same fail-closed application configuration as the WSGI process. Configure all required secrets, hosts, CORS origins, CAPTCHA, and transport settings before invoking it:
+Alembic uses a database-only, fail-closed loader for `DATABASE_HOST`, `DATABASE_PORT`, `DATABASE_NAME`, and owner `DATABASE_USER[_FILE]`/`DATABASE_PASSWORD[_FILE]`. It does not create the Flask application or require Redis, signing, CAPTCHA, host, CORS, or transport configuration, and it emits no URI or secret.
 
 ```bash
 alembic upgrade <revision>

@@ -1,41 +1,195 @@
-version: '3.8'
 services:
+  tls-edge:
+    image: nginx:1.27-alpine@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10
+    ports:
+      - "443:443"
+    volumes:
+      - ./deployment/nginx.conf:/etc/nginx/nginx.conf:ro
+    secrets:
+      - gateway_tls_certificate
+      - gateway_tls_private_key
+    networks:
+      - frontend
+    depends_on:
+      apigateway:
+        condition: service_healthy
+    restart: unless-stopped
+
   apigateway:
     build: .
-    command: >-
-      sh -c "alembic upgrade head && exec gunicorn --bind=0.0.0.0:8181
-      --access-logfile=- --error-logfile=- wsgi:application"
+    command:
+      - gunicorn
+      - --bind=0.0.0.0:8181
+      - --workers=4
+      - --threads=4
+      - --timeout=60
+      - wsgi:application
     environment:
+      DATABASE_HOST: db
+      DATABASE_PORT: "5432"
+      DATABASE_NAME: gateway
+      DATABASE_USER_FILE: /run/secrets/postgres_runtime_user
+      DATABASE_PASSWORD_FILE: /run/secrets/postgres_runtime_password
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_USER_FILE: /run/secrets/redis_username
+      REDIS_PASSWORD_FILE: /run/secrets/redis_password
+      SECRET_KEY_FILE: /run/secrets/gateway_flask_key
+      SECURITY_SERVICE_SECRET_KEY_FILE: /run/secrets/gateway_security_key
+      SECURITY_SERVICE_VERIFY_PASSWORD_SALT_FILE: /run/secrets/gateway_password_salt
+      SECURITY_SERVICE_VERIFY_EMAIL_SALT_FILE: /run/secrets/gateway_email_salt
+      GOOGLE_RECAPTCHA_PRIVATE_KEY_FILE: /run/secrets/gateway_recaptcha_key
+      TRUSTED_HOSTS: "${TRUSTED_HOSTS:?Set exact public gateway authorities}"
+      SITE_HOST_MAPPING: "${SITE_HOST_MAPPING:?Set the JSON host-to-site mapping}"
+      CORS_DOMAINS: "${CORS_DOMAINS:?Set exact HTTPS browser origins}"
+      HTTPS_ENFORCEMENT: "false"
+      TRUSTED_PROXY_HOPS: "1"
       OTEL_SERVICE_NAME: api-gateway
-      ENABLE_OTEL: 'EXPORTER'
+      ENABLE_OTEL: "${ENABLE_OTEL:-EXPORTER}"
     read_only: true
     tmpfs:
       - /tmp
       - /app/logs:uid=10001,gid=10001,mode=0755
-    ports:
-      - "5000:8181"
+    secrets:
+      - postgres_runtime_user
+      - postgres_runtime_password
+      - redis_username
+      - redis_password
+      - gateway_flask_key
+      - gateway_security_key
+      - gateway_password_salt
+      - gateway_email_salt
+      - gateway_recaptcha_key
+    networks:
+      - frontend
+      - backend
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import socket; connection = socket.create_connection(('127.0.0.1', 8181), 2); connection.close()"
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
     depends_on:
-      - db
-      - redis
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  migrate:
+    build: .
+    command: ["/app/deployment/run-migrations.sh"]
+    environment:
+      DATABASE_HOST: db
+      DATABASE_PORT: "5432"
+      DATABASE_NAME: gateway
+      DATABASE_USER_FILE: /run/secrets/postgres_owner_user
+      DATABASE_PASSWORD_FILE: /run/secrets/postgres_owner_password
+      MIGRATION_MAX_ATTEMPTS: "6"
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /app/logs:uid=10001,gid=10001,mode=0755
+    volumes:
+      - ./deployment/run-migrations.sh:/app/deployment/run-migrations.sh:ro
+    secrets:
+      - postgres_owner_user
+      - postgres_owner_password
+    networks:
+      - backend
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "on-failure:3"
+
+
   db:
     image: postgres:17.10-bookworm@sha256:9b18b78397054fce88a9552e9d5a3ad5bb7fd258c5b3cc1c5028e46373d6ea8f
-    ports:
-      - "5434:5432"
     environment:
-      POSTGRES_USER: user
-      POSTGRES_PASSWORD: password
       POSTGRES_DB: gateway
+      POSTGRES_USER_FILE: /run/secrets/postgres_bootstrap_user
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_bootstrap_password
+    secrets:
+      - postgres_bootstrap_user
+      - postgres_bootstrap_password
+      - postgres_owner_user
+      - postgres_owner_password
+      - postgres_runtime_user
+      - postgres_runtime_password
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+      test: ["CMD-SHELL", "pg_isready -d gateway >/dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
     volumes:
       - ./data/db:/var/lib/postgresql/data
+      - ./deployment/init-runtime-role.sh:/docker-entrypoint-initdb.d/010-runtime-role.sh:ro
+    networks:
+      - backend
+    restart: unless-stopped
+
   redis:
     image: redis:8.2.9-bookworm@sha256:66b7f4c2f3c6ef1b298bbd7b13c806bc6f71e61f1136a4f58710daf2cb053b21
-    environment:
-      REDIS_HOST: localhost
-      REDIS_PORT: 6379
-    ports:
-      - "6379:6379"
+    user: redis
+    entrypoint: ["/usr/local/bin/gateway-redis-entrypoint.sh"]
+    secrets:
+      - redis_username
+      - redis_password
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/gateway-redis-healthcheck.sh"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    volumes:
+      - ./deployment/redis-entrypoint.sh:/usr/local/bin/gateway-redis-entrypoint.sh:ro
+      - ./deployment/redis-healthcheck.sh:/usr/local/bin/gateway-redis-healthcheck.sh:ro
+    tmpfs:
+      - /tmp
+    networks:
+      - backend
+    restart: unless-stopped
+
+networks:
+  frontend: {}
+  backend:
+    internal: true
+
+secrets:
+  postgres_bootstrap_user:
+    external: true
+  postgres_bootstrap_password:
+    external: true
+  postgres_owner_user:
+    external: true
+  postgres_owner_password:
+    external: true
+  postgres_runtime_user:
+    external: true
+  postgres_runtime_password:
+    external: true
+  redis_username:
+    external: true
+  redis_password:
+    external: true
+  gateway_flask_key:
+    external: true
+  gateway_security_key:
+    external: true
+  gateway_password_salt:
+    external: true
+  gateway_email_salt:
+    external: true
+  gateway_recaptcha_key:
+    external: true
+  gateway_tls_certificate:
+    external: true
+  gateway_tls_private_key:
+    external: true

@@ -166,3 +166,7 @@ cython_debug/
 # General
 logs/
 .tmp
+
+# Local deployment state and secret material
+/data/
+/secrets/

@@ -11,13 +11,19 @@ permissions:
 
 env:
   PGDATABASE: gateway
-  PGPASSWORD: password
+  PGPASSWORD: ci-database-password-32-bytes
   PGUSER: user
   PGHOST: postgres
   PGPORT: 5432
-  SQLALCHEMY_DATABASE_URI: "postgresql://user:password@postgres:5432/gateway"
-  REDIS_SERVICE_URL: "redis://redis:6379/0"
-  LIMITER_SERVICE_STORAGE_URI: "redis://redis:6379/0"
+  DATABASE_HOST: postgres
+  DATABASE_PORT: 5432
+  DATABASE_NAME: gateway
+  DATABASE_USER: user
+  DATABASE_PASSWORD: ci-database-password-32-bytes
+  REDIS_HOST: redis
+  REDIS_PORT: 6379
+  REDIS_USER: gateway_ci
+  REDIS_PASSWORD: ci-redis-password-32-bytes
   UV_PYTHON_DOWNLOADS: never
 
 jobs:
@@ -31,7 +37,7 @@ jobs:
         image: postgres:17.10-bookworm@sha256:9b18b78397054fce88a9552e9d5a3ad5bb7fd258c5b3cc1c5028e46373d6ea8f
         env:
           POSTGRES_DB: gateway
-          POSTGRES_PASSWORD: password
+          POSTGRES_PASSWORD: ci-database-password-32-bytes
           POSTGRES_USER: user
         ports:
           - 5432:5432
@@ -43,10 +49,14 @@ jobs:
 
       redis:
         image: redis:8.2.9-bookworm@sha256:66b7f4c2f3c6ef1b298bbd7b13c806bc6f71e61f1136a4f58710daf2cb053b21
+        env:
+          REDIS_USER: gateway_ci
+          REDIS_PASSWORD: ci-redis-password-32-bytes
         ports:
           - 6379:6379
         options: >-
-          --health-cmd "redis-cli ping"
+          --health-cmd "REDISCLI_AUTH=$REDIS_PASSWORD redis-cli
+          --no-auth-warning --user $REDIS_USER ping || redis-cli ping"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
@@ -56,7 +66,6 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
-
 
       - name: Set up uv
         uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
@@ -74,6 +83,68 @@ jobs:
 
       - name: Verify installed dependency compatibility
         run: uv pip check --python .venv/bin/python
+
+      - name: Configure authenticated Redis
+        run: |
+          uv run --frozen --extra dev python - <<'PY'
+          import os
+
+          import redis
+
+          host = os.environ["REDIS_HOST"]
+          port = int(os.environ["REDIS_PORT"])
+          username = os.environ["REDIS_USER"]
+          password = os.environ["REDIS_PASSWORD"]
+          admin = redis.Redis(host=host, port=port)
+          admin.execute_command(
+              "ACL",
+              "SETUSER",
+              username,
+              "reset",
+              "on",
+              f">{password}",
+              "resetkeys",
+              "resetchannels",
+              "~gateway:storage:v1:*",
+              "~gateway:cache:v1:*",
+              "~LIMITS:*",
+              "-@all",
+              "+ping",
+              "+select",
+              "+get",
+              "+mget",
+              "+set",
+              "+setex",
+              "+psetex",
+              "+del",
+              "+unlink",
+              "+exists",
+              "+incr",
+              "+incrby",
+              "+incrbyfloat",
+              "+expire",
+              "+pexpire",
+              "+persist",
+              "+ttl",
+              "+pttl",
+              "+keys",
+              "+scan",
+              "+multi",
+              "+exec",
+              "+discard",
+              "+evalsha",
+              "+script|load",
+          )
+          admin.execute_command("ACL", "SETUSER", "default", "off")
+          authenticated = redis.Redis(
+              host=host,
+              port=port,
+              username=username,
+              password=password,
+          )
+          if not authenticated.ping():
+              raise RuntimeError("Authenticated Redis health check failed")
+          PY
 
       - name: Initialize postgres
         run: uv run --frozen --extra dev alembic upgrade head

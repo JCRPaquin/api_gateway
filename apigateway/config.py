@@ -1,8 +1,11 @@
+import ipaddress
 import json
 import os
 import re
 from os import environ
 from urllib.parse import urlsplit
+
+from sqlalchemy.engine import URL
 
 from apigateway.exceptions import ConfigurationError
 
@@ -97,7 +100,14 @@ LOGGING_LEVEL = "DEBUG"
 LOG_STDOUT = False
 
 # Database
-SQLALCHEMY_DATABASE_URI = "postgresql://user:password@db:5432/gateway"
+DATABASE_HOST = environ.get("DATABASE_HOST", "db")
+DATABASE_PORT = _environment_int("DATABASE_PORT", 5432)
+DATABASE_NAME = environ.get("DATABASE_NAME", "gateway")
+DATABASE_USER = environ.get("DATABASE_USER")
+DATABASE_USER_FILE = environ.get("DATABASE_USER_FILE")
+DATABASE_PASSWORD = environ.get("DATABASE_PASSWORD")
+DATABASE_PASSWORD_FILE = environ.get("DATABASE_PASSWORD_FILE")
+SQLALCHEMY_DATABASE_URI = None
 SQLALCHEMY_TRACK_MODIFICATIONS = False
 SECRET_KEY = environ.get("SECRET_KEY")
 SECRET_KEY_FILE = environ.get("SECRET_KEY_FILE")
@@ -136,7 +146,7 @@ PROXY_SERVICE_ALLOWED_HEADERS = ["Content-Type", "Content-Disposition"]
 # Limiter service
 LIMITER_SERVICE_SCALING_COST_ENABLED = True
 LIMITER_SERVICE_SCALING_COST_THRESHOLD = 100
-LIMITER_SERVICE_STORAGE_URI = "redis://redis:6379/0"
+LIMITER_SERVICE_STORAGE_URI = None
 LIMITER_SERVICE_STRATEGY = "fixed-window"
 LIMITER_SERVICE_GROUPS = {
     "example": {
@@ -147,7 +157,13 @@ LIMITER_SERVICE_GROUPS = {
 }
 
 # Redis service
-REDIS_SERVICE_URL = "redis://redis:6379/0"
+REDIS_HOST = environ.get("REDIS_HOST", "redis")
+REDIS_PORT = _environment_int("REDIS_PORT", 6379)
+REDIS_USER = environ.get("REDIS_USER")
+REDIS_USER_FILE = environ.get("REDIS_USER_FILE")
+REDIS_PASSWORD = environ.get("REDIS_PASSWORD")
+REDIS_PASSWORD_FILE = environ.get("REDIS_PASSWORD_FILE")
+REDIS_SERVICE_URL = None
 
 # Storage service
 STORAGE_SERVICE_KEY_PREFIX = "gateway:storage:v1:"
@@ -156,10 +172,7 @@ STORAGE_SERVICE_KEY_PREFIX = "gateway:storage:v1:"
 # Cache service
 CACHE_SERVICE_CACHE_TYPE = "apigateway.redis_serialization.SafeRedisCache"
 CACHE_SERVICE_KEY_PREFIX = "gateway:cache:v1:"
-CACHE_SERVICE_REDIS_URI = (
-    # NOTE: Do not use the same redis DB as other services
-    "redis://redis:6379/1"
-)
+CACHE_SERVICE_REDIS_URI = None
 
 # Security service
 SECURITY_SERVICE_SECRET_KEY = environ.get("SECURITY_SERVICE_SECRET_KEY")
@@ -244,6 +257,216 @@ def _resolve_secret(config, key, invalid):
         invalid.append(key)
         return None, False
     return direct_value, False
+
+
+def _resolve_text_credential(config, key, invalid, minimum_length=1):
+    value, from_file = _resolve_secret(config, key, invalid)
+    if value is None:
+        return None
+    if from_file:
+        try:
+            value = value.decode("utf-8")
+        except UnicodeError:
+            invalid.append(key)
+            return None
+    if (
+        not isinstance(value, str)
+        or len(value) < minimum_length
+        or value.lower().encode("utf-8") in _KNOWN_PLACEHOLDERS
+    ):
+        invalid.append(key)
+        return None
+    return value
+
+
+def canonical_service_host(value):
+    """Return a canonical SQLAlchemy host value or raise ``ValueError``."""
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or any(character.isspace() for character in value)
+        or any(character in value for character in "@/\\?#%")
+    ):
+        raise ValueError
+
+    if value.startswith("[") or value.endswith("]"):
+        if not (value.startswith("[") and value.endswith("]")):
+            raise ValueError
+        address = value[1:-1]
+        try:
+            parsed = ipaddress.IPv6Address(address)
+        except ipaddress.AddressValueError:
+            raise ValueError
+        if value != "[{}]".format(parsed.compressed):
+            raise ValueError
+        return parsed.compressed
+
+    if "[" in value or "]" in value or ":" in value:
+        raise ValueError
+    try:
+        parsed = ipaddress.IPv4Address(value)
+    except ipaddress.AddressValueError:
+        parsed = None
+    if parsed is not None:
+        if value != str(parsed):
+            raise ValueError
+        return value
+    if re.fullmatch(r"[0-9.]+", value):
+        raise ValueError
+    if (
+        value != value.lower()
+        or len(value) > 253
+        or any(not _HOST_LABEL.fullmatch(label) for label in value.split("."))
+    ):
+        raise ValueError
+    return value
+
+
+def _valid_service_host(config, key, invalid):
+    try:
+        return canonical_service_host(config.get(key))
+    except ValueError:
+        invalid.append(key)
+        return None
+
+
+def _valid_endpoint_component(config, key, invalid):
+    value = config.get(key)
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or any(character.isspace() for character in value)
+    ):
+        invalid.append(key)
+        return None
+    return value
+
+
+def _valid_port(config, key, invalid):
+    value = config.get(key)
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 1
+        or value > 65535
+    ):
+        invalid.append(key)
+        return None
+    return value
+
+
+def _configure_state_services(config, invalid, insecure_test_mode):
+    uri_keys = (
+        "SQLALCHEMY_DATABASE_URI",
+        "REDIS_SERVICE_URL",
+        "LIMITER_SERVICE_STORAGE_URI",
+        "CACHE_SERVICE_REDIS_URI",
+    )
+    if insecure_test_mode and all(
+        isinstance(config.get(key), str) and config.get(key) for key in uri_keys
+    ):
+        return
+
+    for key in uri_keys:
+        if config.get(key) is not None:
+            invalid.append(key)
+
+    database_host = _valid_service_host(config, "DATABASE_HOST", invalid)
+    database_port = _valid_port(config, "DATABASE_PORT", invalid)
+    database_name = _valid_endpoint_component(config, "DATABASE_NAME", invalid)
+    database_user = _resolve_text_credential(config, "DATABASE_USER", invalid)
+    database_password = _resolve_text_credential(
+        config, "DATABASE_PASSWORD", invalid, minimum_length=16
+    )
+
+    redis_host = _valid_service_host(config, "REDIS_HOST", invalid)
+    redis_port = _valid_port(config, "REDIS_PORT", invalid)
+    redis_user = _resolve_text_credential(config, "REDIS_USER", invalid)
+    redis_password = _resolve_text_credential(
+        config, "REDIS_PASSWORD", invalid, minimum_length=16
+    )
+
+    if all(
+        value is not None
+        for value in (
+            database_host,
+            database_port,
+            database_name,
+            database_user,
+            database_password,
+        )
+    ):
+        config["SQLALCHEMY_DATABASE_URI"] = URL.create(
+            "postgresql+psycopg2",
+            username=database_user,
+            password=database_password,
+            host=database_host,
+            port=database_port,
+            database=database_name,
+        ).render_as_string(hide_password=False)
+
+    if all(
+        value is not None
+        for value in (redis_host, redis_port, redis_user, redis_password)
+    ):
+        storage_url = URL.create(
+            "redis",
+            username=redis_user,
+            password=redis_password,
+            host=redis_host,
+            port=redis_port,
+            database="0",
+        ).render_as_string(hide_password=False)
+        cache_url = URL.create(
+            "redis",
+            username=redis_user,
+            password=redis_password,
+            host=redis_host,
+            port=redis_port,
+            database="1",
+        ).render_as_string(hide_password=False)
+        config["REDIS_SERVICE_URL"] = storage_url
+        config["LIMITER_SERVICE_STORAGE_URI"] = storage_url
+        config["CACHE_SERVICE_REDIS_URI"] = cache_url
+
+
+def load_migration_database_url(environment=None):
+    """Build the owner database URL without creating the Flask application."""
+    source = environ if environment is None else environment
+    raw_port = source.get("DATABASE_PORT", "5432")
+    try:
+        port = int(raw_port)
+    except (TypeError, ValueError):
+        port = raw_port
+    migration_config = {
+        "DATABASE_HOST": source.get("DATABASE_HOST", "db"),
+        "DATABASE_PORT": port,
+        "DATABASE_NAME": source.get("DATABASE_NAME", "gateway"),
+        "DATABASE_USER": source.get("DATABASE_USER"),
+        "DATABASE_USER_FILE": source.get("DATABASE_USER_FILE"),
+        "DATABASE_PASSWORD": source.get("DATABASE_PASSWORD"),
+        "DATABASE_PASSWORD_FILE": source.get("DATABASE_PASSWORD_FILE"),
+    }
+    invalid = []
+    host = _valid_service_host(migration_config, "DATABASE_HOST", invalid)
+    database_port = _valid_port(migration_config, "DATABASE_PORT", invalid)
+    database = _valid_endpoint_component(migration_config, "DATABASE_NAME", invalid)
+    username = _resolve_text_credential(migration_config, "DATABASE_USER", invalid)
+    password = _resolve_text_credential(
+        migration_config, "DATABASE_PASSWORD", invalid, minimum_length=16
+    )
+    if invalid:
+        raise ConfigurationError(invalid)
+    return URL.create(
+        "postgresql+psycopg2",
+        username=username,
+        password=password,
+        host=host,
+        port=database_port,
+        database=database,
+    ).render_as_string(hide_password=False)
 
 
 def _as_secret_bytes(value):
@@ -412,6 +635,8 @@ def validate_runtime_config(config, allow_insecure_test_config=False):
     insecure_test_mode = testing and allow_insecure_test_config is True
     if allow_insecure_test_config is not False and not insecure_test_mode:
         invalid.append("TESTING")
+
+    _configure_state_services(config, invalid, insecure_test_mode)
 
     resolved = {}
     source_is_file = {}

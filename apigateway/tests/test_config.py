@@ -4,11 +4,16 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from flask import request
+from sqlalchemy.engine import make_url
 from werkzeug.exceptions import BadRequest
+
+from apigateway import config as gateway_config
 from apigateway.config import (
     DEBUG,
     HTTPS_ENFORCEMENT,
     canonical_authority,
+    canonical_service_host,
+    load_migration_database_url,
     validate_runtime_config,
 )
 from apigateway.exceptions import ConfigurationError
@@ -43,6 +48,23 @@ def valid_runtime_config(**overrides):
         "SESSION_COOKIE_SAMESITE": "Lax",
         "HTTPS_ENFORCEMENT": True,
         "TRUSTED_PROXY_HOPS": 0,
+        "SQLALCHEMY_DATABASE_URI": None,
+        "DATABASE_HOST": "db.internal",
+        "DATABASE_PORT": 5432,
+        "DATABASE_NAME": "gateway",
+        "DATABASE_USER": "gateway_runtime",
+        "DATABASE_USER_FILE": None,
+        "DATABASE_PASSWORD": "database-production-password-32-bytes",
+        "DATABASE_PASSWORD_FILE": None,
+        "REDIS_HOST": "redis.internal",
+        "REDIS_PORT": 6379,
+        "REDIS_USER": "gateway",
+        "REDIS_USER_FILE": None,
+        "REDIS_PASSWORD": "redis-production-password-32-bytes",
+        "REDIS_PASSWORD_FILE": None,
+        "REDIS_SERVICE_URL": None,
+        "LIMITER_SERVICE_STORAGE_URI": None,
+        "CACHE_SERVICE_REDIS_URI": None,
     }
     config.update(overrides)
     return config
@@ -101,6 +123,118 @@ def test_secret_file_removes_only_one_terminal_newline(tmp_path):
     )
     validate_runtime_config(config)
     assert config["SECURITY_SERVICE_SECRET_KEY"] == ("f" * 40) + "\n"
+
+
+def test_state_credentials_are_read_from_secret_files(tmp_path):
+    database_user = tmp_path / "database-user"
+    database_password = tmp_path / "database-password"
+    redis_user = tmp_path / "redis-user"
+    redis_password = tmp_path / "redis-password"
+    database_user.write_text("runtime_role\n")
+    database_password.write_text("database/file-password:@-32-bytes\n")
+    redis_user.write_text("gateway_app\n")
+    redis_password.write_text("redis-file-password-32-bytes\n")
+    config = valid_runtime_config(
+        DATABASE_USER=None,
+        DATABASE_USER_FILE=str(database_user),
+        DATABASE_PASSWORD=None,
+        DATABASE_PASSWORD_FILE=str(database_password),
+        REDIS_USER=None,
+        REDIS_USER_FILE=str(redis_user),
+        REDIS_PASSWORD=None,
+        REDIS_PASSWORD_FILE=str(redis_password),
+    )
+
+    validate_runtime_config(config)
+
+    database_url = make_url(config["SQLALCHEMY_DATABASE_URI"])
+    redis_url = make_url(config["REDIS_SERVICE_URL"])
+    assert database_url.username == "runtime_role"
+    assert database_url.password == "database/file-password:@-32-bytes"
+    assert redis_url.username == "gateway_app"
+    assert redis_url.password == "redis-file-password-32-bytes"
+
+
+def test_state_direct_and_file_credentials_are_mutually_exclusive(tmp_path):
+    password_file = tmp_path / "database-password"
+    password_file.write_text("database-file-password-32-bytes")
+    config = valid_runtime_config(DATABASE_PASSWORD_FILE=str(password_file))
+
+    assert_invalid(config, "DATABASE_PASSWORD", "DATABASE_PASSWORD_FILE")
+
+
+def test_state_urls_percent_encode_credentials():
+    database_user = "runtime/user"
+    database_password = "database:@/ percent?#-password-32-bytes"
+    redis_user = "gateway/user"
+    redis_password = "redis:@/ percent?#-password-32-bytes"
+    config = valid_runtime_config(
+        DATABASE_USER=database_user,
+        DATABASE_PASSWORD=database_password,
+        REDIS_USER=redis_user,
+        REDIS_PASSWORD=redis_password,
+    )
+
+    validate_runtime_config(config)
+
+    database_url = config["SQLALCHEMY_DATABASE_URI"]
+    redis_url = config["REDIS_SERVICE_URL"]
+    assert make_url(database_url).username == database_user
+    assert make_url(database_url).password == database_password
+    assert make_url(redis_url).username == redis_user
+    assert make_url(redis_url).password == redis_password
+    assert database_password not in database_url
+    assert redis_password not in redis_url
+
+
+def test_redis_storage_and_limiter_use_db_zero_and_cache_uses_db_one():
+    config = valid_runtime_config()
+    validate_runtime_config(config)
+
+    assert make_url(config["REDIS_SERVICE_URL"]).database == "0"
+    assert make_url(config["LIMITER_SERVICE_STORAGE_URI"]).database == "0"
+    assert make_url(config["CACHE_SERVICE_REDIS_URI"]).database == "1"
+    assert config["REDIS_SERVICE_URL"] == config["LIMITER_SERVICE_STORAGE_URI"]
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["DATABASE_USER", "DATABASE_PASSWORD", "REDIS_USER", "REDIS_PASSWORD"],
+)
+def test_missing_state_credentials_fail_closed(key):
+    config = valid_runtime_config(**{key: None})
+    assert_invalid(config, key)
+
+
+@pytest.mark.parametrize("key", ["DATABASE_PASSWORD", "REDIS_PASSWORD"])
+def test_known_state_password_fallbacks_are_rejected(key):
+    config = valid_runtime_config(**{key: "password"})
+    message = assert_invalid(config, key)
+    assert message == "Invalid application configuration: {}".format(key)
+
+
+def test_preassembled_state_urls_are_production_invalid():
+    config = valid_runtime_config(
+        SQLALCHEMY_DATABASE_URI="postgresql://known:known@db/gateway",
+        REDIS_SERVICE_URL="redis://known:known@redis/0",
+        LIMITER_SERVICE_STORAGE_URI="redis://known:known@redis/0",
+        CACHE_SERVICE_REDIS_URI="redis://known:known@redis/1",
+    )
+    message = assert_invalid(
+        config,
+        "SQLALCHEMY_DATABASE_URI",
+        "REDIS_SERVICE_URL",
+        "LIMITER_SERVICE_STORAGE_URI",
+        "CACHE_SERVICE_REDIS_URI",
+    )
+    assert "known" not in message
+
+
+def test_no_state_service_uri_has_a_shipped_credential_fallback():
+    assert gateway_config.SQLALCHEMY_DATABASE_URI is None
+    assert gateway_config.REDIS_SERVICE_URL is None
+    assert gateway_config.LIMITER_SERVICE_STORAGE_URI is None
+    assert gateway_config.CACHE_SERVICE_REDIS_URI is None
 
 
 @pytest.mark.parametrize(
@@ -211,6 +345,71 @@ def test_factory_test_escape_requires_testing_and_explicit_bypass():
 def test_malformed_authorities_are_rejected(host):
     with pytest.raises(ValueError):
         canonical_authority(host)
+
+
+@pytest.mark.parametrize(
+    "configured,expected",
+    [
+        ("db.internal", "db.internal"),
+        ("127.0.0.1", "127.0.0.1"),
+        ("[2001:db8::1]", "2001:db8::1"),
+    ],
+)
+def test_service_hosts_are_canonical(configured, expected):
+    assert canonical_service_host(configured) == expected
+
+
+@pytest.mark.parametrize(
+    "configured",
+    [
+        "user@db.internal",
+        "db.internal/path",
+        "db.internal?query",
+        "db.internal#fragment",
+        "db%2einternal",
+        "2001:db8::1",
+        "[2001:0db8::1]",
+        "[fe80::1%eth0]",
+        "[2001:db8::1",
+        "2001:db8::1]",
+        "DB.internal",
+        "db.internal.",
+        "127.00.0.1",
+    ],
+)
+def test_service_hosts_reject_authority_confusion(configured):
+    with pytest.raises(ValueError):
+        canonical_service_host(configured)
+
+
+@pytest.mark.parametrize("key", ["DATABASE_HOST", "REDIS_HOST"])
+def test_runtime_config_rejects_noncanonical_state_hosts(key):
+    config = valid_runtime_config(**{key: "user@state.internal/path"})
+    assert_invalid(config, key)
+
+
+def test_migration_loader_reads_only_structured_database_secrets(tmp_path, capsys):
+    owner_user = tmp_path / "owner-user"
+    owner_password = tmp_path / "owner-password"
+    owner_user.write_text("gateway_owner\n")
+    owner_password.write_text("owner-file-password-32-bytes\n")
+    environment = {
+        "DATABASE_HOST": "[2001:db8::1]",
+        "DATABASE_PORT": "5432",
+        "DATABASE_NAME": "gateway",
+        "DATABASE_USER_FILE": str(owner_user),
+        "DATABASE_PASSWORD_FILE": str(owner_password),
+    }
+
+    url = load_migration_database_url(environment)
+
+    parsed = make_url(url)
+    assert parsed.host == "2001:db8::1"
+    assert parsed.username == "gateway_owner"
+    assert parsed.password == "owner-file-password-32-bytes"
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
 
 
 def test_site_mapping_must_exactly_cover_trusted_hosts():
